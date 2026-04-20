@@ -390,3 +390,166 @@ def parse_header(source: Union[bytes, BinaryIO, str]) -> MetaStreamHeader:
 def parse_header_from_file(filepath: str) -> MetaStreamHeader:
     """Convenience wrapper: parse a MetaStream header from a file path."""
     return parse_header(filepath)
+
+
+# ---------------------------------------------------------------------------
+# Block-structured reader — matches iOS BlockInfo semantics
+# ---------------------------------------------------------------------------
+
+class MetaStreamReader:
+    """Block-structured walker for Telltale MetaStream payloads.
+
+    Wraps a ``BinaryReader`` over the payload of a MetaStream file (i.e. the
+    region starting at ``MetaStreamHeader.data_offset``) and exposes the
+    ``begin_block`` / ``end_block`` / ``skip_block`` primitives the iOS
+    runtime uses for every blocked member.
+
+    Block encoding on disk: a blocked member is prefixed by a little-endian
+    ``uint32 block_size`` which includes the 4 bytes of the size prefix
+    itself.  A block occupying ``[start, start + block_size)`` therefore
+    has its payload in ``[start + 4, start + block_size)``.
+
+    Parameters
+    ----------
+    data : bytes
+        Full file contents (header + payload).
+    header : MetaStreamHeader, optional
+        Pre-parsed header.  If omitted, ``parse_header(data)`` is called
+        and its ``data_offset`` is used as the starting position.
+    debug : bool, default False
+        When true, ``end_block`` asserts ``pos == end_abs`` and raises
+        ``ValueError`` on mismatch.  When false, unconsumed trailing bytes
+        in a block are silently skipped (INFRA-04 skip-unknown-members
+        recovery path).
+    """
+
+    def __init__(
+        self,
+        data: bytes,
+        header: "MetaStreamHeader | None" = None,
+        debug: bool = False,
+    ) -> None:
+        if header is None:
+            header = parse_header(data)
+        self._data = data
+        self.header = header
+        self.debug = debug
+        self.reader = BinaryReader(io.BytesIO(data))
+        self.reader.seek(header.data_offset)
+        self._block_stack: list = []
+
+    # -- position + delegation ------------------------------------------
+
+    @property
+    def pos(self) -> int:
+        return self.reader.pos
+
+    def tell(self) -> int:
+        return self.reader.tell()
+
+    def seek(self, offset: int, whence: int = 0) -> None:
+        self.reader.seek(offset, whence)
+
+    def skip(self, n: int) -> None:
+        self.reader.skip(n)
+
+    # -- stream version --------------------------------------------------
+
+    @property
+    def stream_version(self) -> int:
+        """Version of the first class declared in the header, or -1 if none.
+
+        Phase 2's ``Meta_IsMemberDisabled`` + ``min_meta_version`` dispatch
+        consumes this.
+        """
+        if self.header.classes:
+            return self.header.classes[0][1]
+        return -1
+
+    # -- primitive reads (delegated) ------------------------------------
+
+    def read_bytes(self, n: int) -> bytes: return self.reader.read_bytes(n)
+    def read_uint8(self) -> int: return self.reader.read_uint8()
+    def read_uint16(self) -> int: return self.reader.read_uint16()
+    def read_uint32(self) -> int: return self.reader.read_uint32()
+    def read_uint64(self) -> int: return self.reader.read_uint64()
+    def read_int8(self) -> int: return self.reader.read_int8()
+    def read_int16(self) -> int: return self.reader.read_int16()
+    def read_int32(self) -> int: return self.reader.read_int32()
+    def read_int64(self) -> int: return self.reader.read_int64()
+    def read_float32(self) -> float: return self.reader.read_float32()
+    def read_float64(self) -> float: return self.reader.read_float64()
+    def peek_uint32(self) -> int: return self.reader.peek_uint32()
+    def read_string(self, length: int) -> str: return self.reader.read_string(length)
+    def pad_align(self, alignment: int) -> int: return self.reader.pad_align(alignment)
+
+    # Short aliases (match BinaryReader naming)
+    read_u8 = read_uint8
+    read_u16 = read_uint16
+    read_u32 = read_uint32
+    read_u64 = read_uint64
+    read_i8 = read_int8
+    read_i16 = read_int16
+    read_i32 = read_int32
+    read_i64 = read_int64
+    read_f32 = read_float32
+    read_f64 = read_float64
+    peek_u32 = peek_uint32
+
+    # -- block stack -----------------------------------------------------
+
+    def begin_block(self):
+        """Read a ``uint32 block_size`` and push ``(start, end_abs)``.
+
+        ``start`` is the position BEFORE the size prefix; ``end_abs`` is
+        ``start + block_size``.  After this call the position sits just
+        past the size prefix, at the beginning of the block payload.
+        """
+        start = self.pos
+        block_size = self.read_uint32()
+        end_abs = start + block_size
+        self._block_stack.append((start, end_abs))
+        return (start, end_abs)
+
+    def end_block(self) -> int:
+        """Pop the top frame.  In debug mode, assert position matches.
+
+        Returns the ``end_abs`` of the closed block.  On mismatch:
+        - ``debug=True``  -> raise ``ValueError`` with expected/actual
+          positions in the message.
+        - ``debug=False`` -> silently seek to ``end_abs`` (skip-unknown
+          recovery path required by INFRA-04).
+        """
+        if not self._block_stack:
+            raise ValueError("end_block() called with empty block stack")
+        start, end_abs = self._block_stack.pop()
+        if self.pos != end_abs:
+            if self.debug:
+                raise ValueError(
+                    f"Block misalignment: pos={self.pos:#x} "
+                    f"expected={end_abs:#x} "
+                    f"(start={start:#x}, size={end_abs - start})"
+                )
+            self.seek(end_abs)
+        return end_abs
+
+    def skip_block(self) -> int:
+        """Read a block's size prefix and jump to its end without decoding.
+
+        Does NOT push onto the block stack.  Returns the absolute end
+        position (``start + block_size``).  This is the INFRA-04 skip-
+        unknown-member primitive.
+        """
+        start = self.pos
+        block_size = self.read_uint32()
+        end_abs = start + block_size
+        self.seek(end_abs)
+        return end_abs
+
+    def current_block(self):
+        """Top frame of the block stack, or None."""
+        return self._block_stack[-1] if self._block_stack else None
+
+    def block_depth(self) -> int:
+        """Number of currently-open blocks."""
+        return len(self._block_stack)
