@@ -259,28 +259,11 @@ def parse_skeleton(
     r = _Reader(data)
 
     # --- MetaStream header ---------------------------------------------------
+    # SKL has no name/version prefix (unlike D3DMESH); after the header come
+    # bone_file_size and bone_count directly. VerNum/EarlyGameFix are
+    # game-specific and supplied by the caller. Tales of Monkey Island era
+    # uses version=0, early_game_fix=10.
     _parse_metastream_header(r)
-
-    # --- SKL name + version (same as d3dmesh name detection) -----------------
-    # Read the name header so we advance past it.
-    if r.remaining() >= 8:
-        name_header_length = r.u32()
-        name_length = r.u32()
-        if name_length > name_header_length:
-            r.pos -= 4
-            name_length = name_header_length
-        if name_length > 0 and name_length < 4096:
-            _skl_name = r.string(name_length)
-        else:
-            _skl_name = ""
-        # Version byte
-        if r.remaining() >= 1:
-            ver_byte = r.u8()
-            # Version 0 detection: ASCII '0' or '1' => version 0
-            if ver_byte in (0x30, 0x31):
-                version = 0
-            elif ver_byte != 0:
-                version = ver_byte
 
     # --- Special fix for Strong Bad Ep. 2-5 ----------------------------------
     if version == 0 and 4 < early_game_fix < 8:
@@ -351,9 +334,10 @@ def parse_skeleton(
         ty *= model_scale
         tz *= model_scale
 
-        # ---- Rotation quaternion (negate W) ---------------------------------
+        # ---- Rotation quaternion (stored as standard math convention) -------
+        # RTB's MaxScript negates W because 3DS Max reverses quaternion
+        # multiplication order; do NOT negate for glTF/standard use.
         rx, ry, rz, rw = r.f32(), r.f32(), r.f32(), r.f32()
-        rw = -rw  # W MUST BE NEGATED
 
         # ---- Misc per-bone data ---------------------------------------------
         _maybe_header = r.u32()

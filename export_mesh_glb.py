@@ -82,6 +82,121 @@ def parse_submeshes(data, data_offset, face_marker_pos):
         return []
 
 
+def parse_submeshes_with_palette_idx(data, data_offset):
+    """Parse submesh array returning (submesh_block_end, [(bone_palette_idx, start_idx, nprim), ...]).
+
+    The field at +24 in each TriangleSet struct is mBonePaletteIndex
+    (identified via iOS binary MetaClassDescription at file offset 0x5547c0).
+    """
+    try:
+        return _parse_submeshes_with_palette_inner(data, data_offset)
+    except (struct.error, IndexError, ValueError):
+        return 0, []
+
+
+def _parse_submeshes_with_palette_inner(data, data_offset):
+    pos = data_offset
+    dlen = len(data)
+    if pos + 8 > dlen:
+        return 0, []
+    name_hdr_len = struct.unpack_from('<I', data, pos)[0]
+    name_len = struct.unpack_from('<I', data, pos + 4)[0]
+    if name_len > name_hdr_len:
+        name_len = name_hdr_len
+        name_start = pos + 4
+    else:
+        name_start = pos + 8
+    if name_len > 256 or name_start + name_len + 1 > dlen:
+        return 0, []
+    pos = name_start + name_len + 1 + 28
+    if pos + 8 > dlen:
+        return 0, []
+    head3a_size = struct.unpack_from('<I', data, pos)[0]
+    submesh_count = struct.unpack_from('<I', data, pos + 4)[0]
+    submesh_block_end = pos + 4 + head3a_size
+    pos += 8
+    if submesh_count == 0 or submesh_count > 500:
+        return 0, []
+    avg_struct_size = head3a_size // submesh_count if submesh_count > 0 else 0
+    results = []
+    for _ in range(submesh_count):
+        struct_start = pos
+        if pos + 24 + 24 > dlen:
+            break
+        bone_pal = struct.unpack_from('<I', data, struct_start + 24)[0]
+        pos += 24
+        start_index = struct.unpack_from('<I', data, pos + 16)[0]
+        nprim = struct.unpack_from('<I', data, pos + 20)[0]
+        pos += 24
+        results.append((bone_pal, start_index, nprim))
+        if pos + 36 + 4 > dlen:
+            break
+        pos += 36
+        mat_block_len = struct.unpack_from('<I', data, pos)[0]
+        if mat_block_len > 50000 or pos + 4 + mat_block_len > dlen:
+            break
+        pos += 4 + mat_block_len
+        if pos + 4 > dlen:
+            break
+        tex_name_len = struct.unpack_from('<I', data, pos)[0]
+        if tex_name_len > 1000 or pos + 4 + tex_name_len > dlen:
+            break
+        pos += 4 + tex_name_len
+        advanced = False
+        scan_limit = min(pos + 200, submesh_block_end, dlen)
+        for scan in range(pos, scan_limit):
+            if data[scan] == 0x31 and scan + 5 <= dlen:
+                block_size = struct.unpack_from('<I', data, scan + 1)[0]
+                if 4 <= block_size <= 512 and scan + 1 + 4 + block_size + 162 <= dlen:
+                    pos = scan + 1 + 4 + block_size + 162
+                    advanced = True
+                    break
+        if not advanced:
+            if avg_struct_size > 0:
+                pos = struct_start + avg_struct_size
+            else:
+                break
+    return submesh_block_end, results
+
+
+def parse_bone_palettes(data, start_offset):
+    """Parse the bone palette section at start_offset.
+
+    Layout (v1 ERTM, hashed bones):
+        u32 0 (separator?)
+        u32 palette_section_size
+        u32 num_palettes
+        for each palette:
+            u32 bone_count
+            for each bone:
+                u32 hash_low
+                u32 hash_high
+                u32 padding
+
+    Returns list-of-lists of 64-bit hashes.
+    """
+    try:
+        p = start_offset + 4  # skip separator
+        section_size = struct.unpack_from('<I', data, p)[0]; p += 4
+        num_palettes = struct.unpack_from('<I', data, p)[0]; p += 4
+        if num_palettes > 64 or section_size > 65536:
+            return []
+        palettes = []
+        for _ in range(num_palettes):
+            cnt = struct.unpack_from('<I', data, p)[0]; p += 4
+            if cnt > 256:
+                return []
+            bones = []
+            for _ in range(cnt):
+                low, high = struct.unpack_from('<II', data, p); p += 8
+                p += 4  # padding
+                bones.append((high << 32) | low)
+            palettes.append(bones)
+        return palettes
+    except (struct.error, IndexError):
+        return []
+
+
 def _parse_submeshes_inner(data, data_offset, face_marker_pos):
     pos = data_offset
     dlen = len(data)
