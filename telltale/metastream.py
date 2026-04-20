@@ -85,17 +85,63 @@ class BinaryReader:
             )
         return data
 
+    def read_uint8(self) -> int:
+        return struct.unpack("<B", self.read_bytes(1))[0]
+
+    read_u8 = read_uint8
+
+    def read_uint16(self) -> int:
+        return struct.unpack("<H", self.read_bytes(2))[0]
+
+    read_u16 = read_uint16
+
     def read_uint32(self) -> int:
         return struct.unpack("<I", self.read_bytes(4))[0]
 
     # Alias used by the older API expected by other modules in the project.
     read_u32 = read_uint32
 
+    def read_int8(self) -> int:
+        return struct.unpack("<b", self.read_bytes(1))[0]
+
+    read_i8 = read_int8
+
+    def read_int16(self) -> int:
+        return struct.unpack("<h", self.read_bytes(2))[0]
+
+    read_i16 = read_int16
+
     def read_int32(self) -> int:
         return struct.unpack("<i", self.read_bytes(4))[0]
 
+    read_i32 = read_int32
+
+    def read_int64(self) -> int:
+        return struct.unpack("<q", self.read_bytes(8))[0]
+
+    read_i64 = read_int64
+
     def read_uint64(self) -> int:
         return struct.unpack("<Q", self.read_bytes(8))[0]
+
+    read_u64 = read_uint64
+
+    def read_float32(self) -> float:
+        return struct.unpack("<f", self.read_bytes(4))[0]
+
+    read_f32 = read_float32
+
+    def read_float64(self) -> float:
+        return struct.unpack("<d", self.read_bytes(8))[0]
+
+    read_f64 = read_float64
+
+    def pad_align(self, alignment: int) -> int:
+        """Advance pos to the next multiple of *alignment* (skips padding bytes)."""
+        rem = self.pos % alignment
+        if rem:
+            self.skip(alignment - rem)
+        return self.pos
 
     def peek_uint32(self) -> int:
         """Read a uint32 without advancing the stream position."""
