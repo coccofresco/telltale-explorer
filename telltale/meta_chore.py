@@ -1211,3 +1211,108 @@ def assert_field_byte_range(
             f"fmt={fmt} decoded={decoded_value!r} "
             f"expected_bytes={expected.hex()} actual_bytes={actual.hex()}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Handle-graph extractor (Phase 8 Plan 08-01)
+# ---------------------------------------------------------------------------
+
+def _walk_for_handles(obj: object, out: "set[str]", _seen: "set[int] | None" = None, _depth: int = 0) -> None:
+    """Recursive walker that harvests Handle-valued strings from any decoded object.
+
+    Rules:
+      - Skips None, bool, int, float, bytes, and other primitives.
+      - For dataclasses: iterates dataclasses.fields(obj) and recurses on each value.
+        Additionally, if the object IS a Handle (telltale.meta_handle.Handle) with a
+        non-empty object_name_str, that string is added to ``out``.
+      - For dicts: recurses on every VALUE (keys are Symbols / u64, not targets).
+      - For lists / tuples: recurses on each element.
+      - Uses id(obj) in ``_seen`` to prevent infinite loops on cyclic graphs.
+      - Hard cap at depth 16 (EP1 chores don't nest deeper).
+
+    The MTRE decode path stores ChoreResource.mhObject as a bare str (not a Handle
+    object).  That case is handled explicitly in extract_handles() before this
+    walker is invoked — the walker does NOT add arbitrary strings.
+    """
+    if _depth > 16:
+        return
+    if obj is None or isinstance(obj, (bool, int, float, bytes, str)):
+        return
+
+    if _seen is None:
+        _seen = set()
+    oid = id(obj)
+    if oid in _seen:
+        return
+    _seen.add(oid)
+
+    import dataclasses
+    # Lazy import to avoid circular at module load time.
+    from telltale.meta_handle import Handle
+
+    if isinstance(obj, Handle):
+        name = obj.object_name_str
+        if isinstance(name, str) and name:
+            out.add(name)
+        # Still recurse into fields in case future Handle subclasses carry children,
+        # but the main value is already harvested above.
+
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        for f in dataclasses.fields(obj):
+            val = getattr(obj, f.name, None)
+            _walk_for_handles(val, out, _seen, _depth + 1)
+    elif isinstance(obj, dict):
+        for val in obj.values():
+            _walk_for_handles(val, out, _seen, _depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            _walk_for_handles(item, out, _seen, _depth + 1)
+
+
+def extract_handles(chore: Chore) -> "list[str]":
+    """Walk every Handle<T>-typed field of a decoded Chore and return every
+    embedded handle-string in the union across:
+
+      - chore.resources[*].mhObject  (Handle or plain str in MTRE path)
+      - chore.mDependencies.mpResNames  (DependencyLoader<1> list[str])
+      - chore.mEditorProps / chore.resources[*].mResourceProperties
+        (PropertySet values that decode to Handle objects — visited recursively)
+      - chore.mWalkPaths values (Map<Symbol, WalkPath> — walked recursively)
+      - any other nested Handle<T> discovered by the recursive walker
+
+    MTRE vs MSV5+ note:
+      MTRE chores (all 1929 EP1 files) store ChoreResource.mhObject as a plain
+      string.  MSV5+ chores store it as a Handle dataclass.  Both cases are
+      handled: the plain-string case is harvested explicitly (step 1), and the
+      Handle-object case falls through to the recursive walker (step 3).
+
+    VALIDATE-05 contract: for every EP1 chore, the returned set, when filtered
+    by inspect_chore._PLAUSIBLE_HANDLE_EXTS, MUST be a superset of
+    inspect_chore.inspect(path).handles.
+
+    Returns a sorted, de-duplicated list[str].
+    """
+    out: set[str] = set()
+
+    # Step 1: explicit mhObject field — MTRE path stores a plain str; MSV5 stores Handle.
+    for r in chore.resources:
+        mh = r.mhObject
+        if isinstance(mh, str) and mh:
+            out.add(mh)
+        # Handle-object case is picked up by the recursive walker below (step 3).
+
+    # Step 2: DependencyLoader<1>.mpResNames — list[str] of dependency filenames.
+    deps_obj = chore.mDependencies
+    if deps_obj is not None:
+        # mpResNames is the authoritative attribute name in DependencyLoader1 dataclass.
+        mpres = getattr(deps_obj, "mpResNames", None)
+        if isinstance(mpres, list):
+            for p in mpres:
+                if isinstance(p, str) and p:
+                    out.add(p)
+
+    # Step 3: Recursive walk — harvests Handle.object_name_str from all nested objects
+    #   including PropertySet values, WalkPath entries, ToolProps.mProps, etc.
+    _walk_for_handles(chore, out)
+
+    return sorted(out)
