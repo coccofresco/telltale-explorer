@@ -26,8 +26,10 @@ telltale/meta_ptable.py and telltale/meta_math.py).
 from __future__ import annotations
 
 import logging
+import struct
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from pathlib import Path
+from typing import Any, Iterable, List, Optional
 
 from telltale.metaclass import meta_class, meta_member, get_by_hash
 from telltale.meta_intrinsics import (
@@ -36,9 +38,20 @@ from telltale.meta_intrinsics import (
     decode_symbol,
 )
 from telltale.meta_handle import Handle
-from telltale.metastream import MetaStreamReader
+from telltale.metastream import MetaStreamReader, parse_header
+from telltale.validation import ChoreValidationReport
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level constants (used by _walk_to_editor_props and harness)
+# ---------------------------------------------------------------------------
+
+# Expected total byte count (prefix + content) of a blocked empty PropertySet in MTRE.
+# Derived from 05-01 plan SUMMARY: 4(prefix) + 8(mPropVersion block) + 8(mPropertyFlags block)
+# + 16(mHOI block) + 12(custom block) = 48 bytes.  Used as a sanity-check against the
+# block_size we observe at second_start in the 3 hint chores.
+EXPECTED_EMPTY_PROPSET_BYTES = 48
 
 # ---------------------------------------------------------------------------
 # PropertyFlags constants (PropertySet.h lines 119-125)
@@ -483,18 +496,29 @@ def decode_keyframed_value_vector3(reader: MetaStreamReader, sv: int) -> Keyfram
 def decode_propertyset(reader: MetaStreamReader, stream_version: int) -> PropertySet:
     """Decode a PropertySet from the reader.
 
-    Implements the exact wire frame from
-    PropertySet.h lines 242-448 (MetaOperation_SerializeAsync).
+    Implements the wire frame from PropertySet.h lines 242-448
+    (MetaOperation_SerializeAsync), supporting two serialization sub-formats
+    detected via a peek at the first u32 in the member region:
+
+    FORMAT A — BLOCKED (standard synthetic / MSV5/MSV6 serialization):
+        Detected by: peek_uint32() == 8.  Each declared member is individually
+        block-wrapped (block_size=8 for a u32 member).
+
+    FORMAT B — INLINE (observed in real EP1 MTRE hint chores; validated against
+        guybrush_hint_usenose_e2_135.chore, glassblowermechanisms.chore,
+        guybrush_hint_usenose_e3_136.chore at commit time of plan 05-02):
+        Detected by: peek_uint32() != 8.  Members are NOT individually block-
+        wrapped (MetaSerializeBlockingDisabled-style layout).  mHOI is
+        SerializeDisabled (zero wire bytes).  One padding byte follows
+        mPropertyFlags before the custom section block.
 
     Step 1 — default member walker (PropertySet.h line 263):
-        Each declared member is block-wrapped (no MetaFlag_MetaSerializeBlockingDisabled
-        on any of these members in standard TMI use).
-
         Members in declaration order (PropertySet.h lines 227-235):
-          mPropVersion  (int32)
-          mPropertyFlags (Flags/u32)
-          mKeyMap, mParentList: assumed MetaSerializeDisable in TMI (no wire bytes).
-          mHOI (HandleObjectInfo.h lines 14-16: Symbol u64 + Flags u32)
+          mPropVersion  (int32 / blocked or inline)
+          mPropertyFlags (Flags/u32 / blocked or inline)
+          mKeyMap, mParentList: SerializeDisable — no wire bytes in either format.
+          mHOI (HandleObjectInfo.h lines 14-16): blocked in FORMAT A;
+               SerializeDisabled (0 bytes) + 1-byte padding in FORMAT B.
 
     Step 2 — custom BeginBlock section (PropertySet.h line 276):
         u32 parents_count
@@ -518,32 +542,45 @@ def decode_propertyset(reader: MetaStreamReader, stream_version: int) -> Propert
     Note on Symbol serialization: the MTRE Map-key debug-strlen trailing u32
     is a container artifact for Map<Symbol, V> only (meta_containers.py).
     PropertySet's own bare serialize_Symbol calls are plain u64 reads with no
-    trailing u32 on any format version. Confirmed per plan 05-01 wire_format
-    section. Plan 05-02 will empirically verify against real hint-chore bytes.
+    trailing u32 on any format version. Confirmed empirically in plan 05-02.
     """
-    # ---- default member walker ----
+    # ---- detect format (peek at first u32) ----
+    # In FORMAT A (blocked), the first u32 is the block_size for the mPropVersion
+    # member block, which is always 8 (size prefix 4 + payload 4 for a u32/i32).
+    # In FORMAT B (inline), the first u32 is the mPropVersion VALUE (typically 0,
+    # 1, or 2 for known EP1 chores), never 8.
+    _first_u32 = reader.peek_uint32()
+    _inline = (_first_u32 != 8)
 
-    # mPropVersion (int, blocked)
-    reader.begin_block()
-    mPropVersion = reader.read_int32()
-    reader.end_block()
+    if _inline:
+        # FORMAT B: inline reads; mHOI SerializeDisabled + 1-byte pad before custom section.
+        # Validated against the 3 EP1 hint chores (guybrush_hint_usenose_e2_135.chore,
+        # glassblowermechanisms.chore, guybrush_hint_usenose_e3_136.chore).
+        mPropVersion = reader.read_uint32()
+        mPropertyFlags = reader.read_uint32()
+        # mHOI is SerializeDisabled in the real MTRE chore format; 1 padding byte follows.
+        reader.skip(1)
+        mHOI = Handle(object_name_crc=0, object_name_str=None)
+    else:
+        # FORMAT A: standard per-member block-wrapped reads (synthetic test fixtures).
+        reader.begin_block()
+        mPropVersion = reader.read_int32()
+        reader.end_block()
 
-    # mPropertyFlags (Flags/u32, blocked)
-    reader.begin_block()
-    mPropertyFlags = reader.read_uint32()
-    reader.end_block()
+        reader.begin_block()
+        mPropertyFlags = reader.read_uint32()
+        reader.end_block()
 
-    # mKeyMap + mParentList: SerializeDisable assumed — no wire bytes.
-    # If Plan 05-02 shows these DO appear, revise under Rule 1 Discovery.
-    # Reference: PropertySet.h lines 230-232 (DCArray members).
+        # mKeyMap + mParentList: SerializeDisable — no wire bytes.
+        # Reference: PropertySet.h lines 230-232 (DCArray members).
 
-    # mHOI (HandleObjectInfo, blocked)
-    # HandleObjectInfo.h lines 14-16: Symbol mObjectName (u64) + Flags mFlags (u32)
-    reader.begin_block()
-    hoi_sym = reader.read_uint64()      # mObjectName Symbol CRC
-    hoi_flags = reader.read_uint32()    # mFlags
-    reader.end_block()
-    mHOI = Handle(object_name_crc=hoi_sym, object_name_str=None)
+        # mHOI (HandleObjectInfo, blocked)
+        # HandleObjectInfo.h lines 14-16: Symbol mObjectName (u64) + Flags mFlags (u32)
+        reader.begin_block()
+        hoi_sym = reader.read_uint64()      # mObjectName Symbol CRC
+        reader.read_uint32()                # mFlags (consumed but not stored)
+        reader.end_block()
+        mHOI = Handle(object_name_crc=hoi_sym, object_name_str=None)
 
     # ---- custom section (PropertySet.h line 276 BeginBlock) ----
     reader.begin_block()
@@ -671,3 +708,150 @@ _register_propertyset_decoders()
 # template instantiation; all five concrete classes are also importable
 # by their full names.
 KeyframedValue = KeyframedValueFloat
+
+
+# ---------------------------------------------------------------------------
+# Plan 05-02: Chore-to-mEditorProps skipper + validation harness
+# ---------------------------------------------------------------------------
+
+def _effective_sv(format_version_str: str) -> int:
+    """Map a MetaStream format version string to an integer stream version.
+
+    Returns 3 for 'MTRE' (the EP1 hint chore format) and -1 for any
+    unrecognised format string.  This is the integer that PropertySet
+    and container decoders receive as ``stream_version``.
+
+    Pattern borrowed from ``tests/test_meta_containers_ptable_integration.py``.
+    """
+    _MAP = {"MTRE": 3, "MSV5": 5, "MSV6": 6, "MBIN": 1}
+    return _MAP.get(format_version_str, -1)
+
+
+def _walk_to_editor_props(
+    reader: MetaStreamReader,
+    format_version_str: str,
+    total_len: int,
+    data_bytes: bytes,
+) -> tuple:
+    """Advance *reader* to the mEditorProps PropertySet block in a Chore file.
+
+    Returns ``(block_start, block_end_abs)`` — the coordinates of the
+    block_size-prefixed PropertySet block.  After this call ``reader.pos``
+    equals ``block_start``.  The caller is responsible for calling
+    ``reader.begin_block()`` before ``decode_propertyset()``.
+
+    EMPIRICAL SKIPPER — validated against the 3 EP1 hint chores at plan 05-02
+    commit time (2026-04-20).  Phase 7 will replace this with a proper Chore
+    decoder derived from iOS Chore::SerializeAsync disasm.
+
+    Observed Outcome (plan 05-02 empirical byte analysis):
+        The 48-byte block immediately following the mName String block IS the
+        mEditorProps PropertySet member block (Outcome A, MTRE format).
+        All 3 hint chores share the same skeleton:
+
+            [data_offset .. mname_end]:   mName String block (variable size)
+            [mname_end .. mname_end+48]:  mEditorProps PropertySet block (size=48)
+
+        Files validated:
+            guybrush_hint_usenose_e2_135.chore  (184 B): mname_end=98,  PropSet=[98..146]
+            glassblowermechanisms.chore          (189 B): mname_end=91,  PropSet=[91..139]
+            guybrush_hint_usenose_e3_136.chore  (184 B): mname_end=98,  PropSet=[98..146]
+
+        Inside the PropertySet block, members use inline (blocking-disabled) reads
+        rather than per-member block wrappers as observed in standard TMI usage.
+        See decode_propertyset() FORMAT B branch for the exact read sequence.
+
+    Parameters
+    ----------
+    reader : MetaStreamReader
+        Positioned at ``data_offset`` (start of the payload, set by __init__).
+    format_version_str : str
+        The ``header.version`` string (e.g. ``'MTRE'``).  Only MTRE is
+        supported for Phase 5; other formats raise ``AssertionError``.
+    total_len : int
+        Total length of the file in bytes (used for future sanity checks).
+    data_bytes : bytes
+        Full file content (used to read the block_size prefix without
+        disturbing the reader position).
+    """
+    assert format_version_str == "MTRE", (
+        f"Phase 5 only supports MTRE hint chores; got {format_version_str!r}"
+    )
+
+    # Skip the mName String block — the PropertySet block follows immediately.
+    reader.skip_block()
+
+    # Record the PropertySet block coordinates.
+    block_start = reader.pos
+    blk_size = struct.unpack_from("<I", data_bytes, block_start)[0]
+    block_end_abs = block_start + blk_size
+
+    # Sanity-check: for the 3 hint chores the block size MUST equal
+    # EXPECTED_EMPTY_PROPSET_BYTES (48).  A different value indicates Chore
+    # schema drift or a corpus file that lies outside the Phase 5 scope.
+    if blk_size != EXPECTED_EMPTY_PROPSET_BYTES:
+        raise ValueError(
+            f"Expected mEditorProps block size {EXPECTED_EMPTY_PROPSET_BYTES}, "
+            f"got {blk_size} at offset {block_start} in {total_len}-byte file "
+            f"— Chore schema drift? (Phase 7 decoder required)"
+        )
+
+    return (block_start, block_end_abs)
+
+
+def validate_propertyset_corpus(paths: Iterable) -> ChoreValidationReport:
+    """Validate PropertySet (mEditorProps) decoding across a set of Chore files.
+
+    For each file:
+      1. Parse the MTRE header.
+      2. Use ``_walk_to_editor_props`` to locate the mEditorProps block.
+      3. Call ``decode_propertyset`` and check ``reader.pos == block_end_abs``.
+      4. Record clean / misalignment in the returned report.
+
+    Exceptions (I/O errors, schema drift, unexpected EOFError) are caught and
+    recorded as misalignment entries with an ``"exception: ..."`` message.
+
+    Returns
+    -------
+    ChoreValidationReport
+        ``summary()`` is ``'3/3 clean (0 misaligned)'`` when all 3 EP1 hint
+        chores pass.  VALIDATE-02 is closed when this assertion holds.
+    """
+    report = ChoreValidationReport()
+    for p in paths:
+        p = Path(p)
+        reader = None
+        try:
+            data = p.read_bytes()
+            header = parse_header(data)
+            reader = MetaStreamReader(data, header=header, debug=False)
+            sv = _effective_sv(header.version)
+            block_start, block_end_abs = _walk_to_editor_props(
+                reader, header.version, len(data), data
+            )
+            assert reader.pos == block_start, (
+                f"reader.pos={reader.pos} != block_start={block_start}"
+            )
+            reader.begin_block()
+            decode_propertyset(reader, sv)
+            reader.end_block()
+            if reader.pos == block_end_abs:
+                report.record_clean(str(p))
+            else:
+                report.record_misalignment(
+                    str(p),
+                    reader.pos,
+                    block_end_abs,
+                    reader.pos,
+                    f"pos {reader.pos} != block_end_abs {block_end_abs}",
+                )
+        except Exception as exc:
+            pos = reader.pos if reader is not None else -1
+            report.record_misalignment(
+                str(p),
+                pos,
+                0,
+                0,
+                f"exception: {type(exc).__name__}: {exc}",
+            )
+    return report
