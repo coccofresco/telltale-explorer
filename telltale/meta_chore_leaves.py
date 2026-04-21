@@ -48,10 +48,16 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from telltale.crc64 import crc64_str
-from telltale.metaclass import meta_class, meta_member
-from telltale.meta_intrinsics import register, decode_string
+from telltale.metaclass import meta_class, meta_member, get_by_hash
+from telltale.meta_intrinsics import (
+    register,
+    decode_string,
+    decode_symbol,
+    get_decoder_by_hash,
+)
 from telltale.metastream import MetaStreamReader
 from telltale.meta_propertyset import decode_propertyset
+from telltale.meta_containers import dispatch_container
 
 log = logging.getLogger(__name__)
 
@@ -436,3 +442,403 @@ CURATED_CHORE_FILES: List[str] = [
 ]
 
 CURATED_CORPUS_ROOT: Path = Path("extracted/ep1_chore")
+
+
+# ========================================================================
+# Plan 06-02 Task 1: PathBase family + WalkPath polymorphic dispatch
+# ========================================================================
+#
+# TTL sources:
+#   PathBase              — Chore.h lines 29-37;   MetaInitialize.h lines 1896, 2065
+#   PathSegment           — Chore.h lines 39-56;   MetaInitialize.h lines 2069-2075
+#   HermiteCurvePathSegment — Chore.h lines 58-75; MetaInitialize.h lines 2078-2086
+#   AnimationDrivenPathSegment — Chore.h lines 77-99; MetaInitialize.h lines 2089-2106
+#   WalkPath              — Chore.h lines 101-166; MetaInitialize.h lines 2109-2112
+# ========================================================================
+
+
+# ---------------------------------------------------------------------------
+# UnknownPath sentinel (runtime-only — NOT @meta_class registered)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UnknownPath:
+    """Sentinel for WalkPath mPath entries whose concrete-type hash is not
+    registered.  decode_walk_path logs a warning + calls skip_block() and
+    appends one of these instead of raising.
+
+    This mirrors the UnknownPropertyValue pattern in meta_propertyset.py.
+    """
+    type_hash: int
+
+
+# ---------------------------------------------------------------------------
+# PathBase family dataclasses
+# ---------------------------------------------------------------------------
+
+@meta_class("PathBase")
+@dataclass
+class PathBase:
+    """PathBase — Chore.h lines 29-37; MetaInitialize.h lines 1896, 2065.
+
+    Abstract base for path segment types.  TTL registration:
+        DEFINET2(pathbase, PathBase)  — no FIRSTMEM, no SERIALIZER
+    Wire: ZERO bytes.  PathBase has no serialized members; it is purely an
+    abstract base.  Instances appear only as concrete PathSegment /
+    HermiteCurvePathSegment / AnimationDrivenPathSegment on the wire.
+    """
+    pass  # no serialized fields
+
+
+@meta_class("PathSegment")
+@dataclass
+class PathSegment:
+    """PathSegment — Chore.h lines 39-56; MetaInitialize.h lines 2069-2075.
+
+    Inherits PathBase (zero wire bytes from base).
+    Wire: 4 blocked members (mStart, mEnd, mStartNodeId, mEndNodeId).
+    Total blocked bytes: 48 B.
+
+        mStart   (Vector3, 12 B payload + 4 B prefix = 16 B block)
+        mEnd     (Vector3, 16 B block)
+        mStartNodeId (u32, 4 B payload + 4 B prefix = 8 B block)
+        mEndNodeId   (u32, 8 B block)
+
+    Note: TTL also registers a Baseclass_PathBase alias + ALAIS mStart entry
+    as a layout workaround (vtable offset in C++ inheritance), but these do NOT
+    produce extra wire bytes.
+    """
+    mStart_x: float = meta_member("mStart_x", float)
+    mStart_y: float = meta_member("mStart_y", float)
+    mStart_z: float = meta_member("mStart_z", float)
+    mEnd_x: float = meta_member("mEnd_x", float)
+    mEnd_y: float = meta_member("mEnd_y", float)
+    mEnd_z: float = meta_member("mEnd_z", float)
+    mStartNodeId: int = meta_member("mStartNodeId", int)
+    mEndNodeId: int = meta_member("mEndNodeId", int)
+
+
+@meta_class("HermiteCurvePathSegment")
+@dataclass
+class HermiteCurvePathSegment:
+    """HermiteCurvePathSegment — Chore.h lines 58-75; MetaInitialize.h lines 2078-2086.
+
+    Inherits PathBase (zero wire bytes from base).
+    Wire: 6 blocked members (mStart, mEnd, mStartDir, mEndDir, mStartNodeId, mEndNodeId).
+    Total blocked bytes: 80 B.
+
+        mStart    (16 B block)
+        mEnd      (16 B block)
+        mStartDir (16 B block)
+        mEndDir   (16 B block)
+        mStartNodeId (8 B block)
+        mEndNodeId   (8 B block)
+    """
+    mStart_x: float = meta_member("mStart_x", float)
+    mStart_y: float = meta_member("mStart_y", float)
+    mStart_z: float = meta_member("mStart_z", float)
+    mEnd_x: float = meta_member("mEnd_x", float)
+    mEnd_y: float = meta_member("mEnd_y", float)
+    mEnd_z: float = meta_member("mEnd_z", float)
+    mStartDir_x: float = meta_member("mStartDir_x", float)
+    mStartDir_y: float = meta_member("mStartDir_y", float)
+    mStartDir_z: float = meta_member("mStartDir_z", float)
+    mEndDir_x: float = meta_member("mEndDir_x", float)
+    mEndDir_y: float = meta_member("mEndDir_y", float)
+    mEndDir_z: float = meta_member("mEndDir_z", float)
+    mStartNodeId: int = meta_member("mStartNodeId", int)
+    mEndNodeId: int = meta_member("mEndNodeId", int)
+
+
+@meta_class("AnimationDrivenPathSegment::EnumAnimatedPathSegmentType")
+@dataclass
+class EnumAnimatedPathSegmentType:
+    """AnimationDrivenPathSegment::EnumAnimatedPathSegmentType.
+
+    TTL source: Chore.h lines 83-92; MetaInitialize.h lines 2089-2097.
+    Wire: 1 blocked member — mVal (long == i32).
+
+    Registered under the scoped TTL name including class prefix.
+    """
+    mVal: int = meta_member("mVal", int)
+
+
+@meta_class("AnimationDrivenPathSegment")
+@dataclass
+class AnimationDrivenPathSegment:
+    """AnimationDrivenPathSegment — Chore.h lines 77-99; MetaInitialize.h lines 2098-2106.
+
+    Inherits PathBase (zero wire bytes from base).
+    Wire: 5 blocked members:
+        mStart          (16 B block)
+        mEnd            (16 B block)
+        mStartDirection (16 B block)
+        mEndDirection   (16 B block)
+        mAnimType       — nested EnumAnimatedPathSegmentType block:
+                          [u32 outer_block_size][u32 mVal_block_size=8][i32 mVal_value]
+                          = 4 + 8 = 12 bytes total for mAnimType
+
+    Total blocked bytes: 4*16 + 12 = 76 B.
+    """
+    mStart_x: float = meta_member("mStart_x", float)
+    mStart_y: float = meta_member("mStart_y", float)
+    mStart_z: float = meta_member("mStart_z", float)
+    mEnd_x: float = meta_member("mEnd_x", float)
+    mEnd_y: float = meta_member("mEnd_y", float)
+    mEnd_z: float = meta_member("mEnd_z", float)
+    mStartDirection_x: float = meta_member("mStartDirection_x", float)
+    mStartDirection_y: float = meta_member("mStartDirection_y", float)
+    mStartDirection_z: float = meta_member("mStartDirection_z", float)
+    mEndDirection_x: float = meta_member("mEndDirection_x", float)
+    mEndDirection_y: float = meta_member("mEndDirection_y", float)
+    mEndDirection_z: float = meta_member("mEndDirection_z", float)
+    mAnimType: EnumAnimatedPathSegmentType = meta_member("mAnimType", object)
+
+
+@meta_class("WalkPath")
+@dataclass
+class WalkPath:
+    """WalkPath — Chore.h lines 101-166; MetaInitialize.h lines 2109-2112.
+
+    TTL registration (MetaInitialize.h):
+        DEFINET2(wpath, WalkPath)
+        FIRSTMEM2(wpath, mName, WalkPath, string, 0)  — ONLY mName registered
+        SERIALIZER(wpath, WalkPath)  — custom serializer handles mPath
+
+    Wire:
+        - Default member walker: mName (blocked String)
+        - Custom SERIALIZER section (Chore.h lines 119-162):
+            [u32 count]    (INLINE bare u32 — count of PathBase* elements)
+            for each:
+                [u64 type_hash]  (INLINE bare u64 — concrete subclass CRC64)
+                [u32 outer_block_size][subclass members...]   (PerformMetaSerializeFull)
+
+    mPath is populated by decode_walk_path; it is NOT a meta_member because
+    mPath has MetaFlag_MetaSerializeDisable in TTL (only mName is registered).
+    """
+    mName: str = meta_member("mName", str)
+    mPath: list = field(default_factory=list)  # list[PathSegment|HermiteCurvePathSegment|AnimationDrivenPathSegment|UnknownPath]
+
+
+# ---------------------------------------------------------------------------
+# Private helpers — Vector3 and u32 blocked reads
+# ---------------------------------------------------------------------------
+
+def _decode_vector3_blocked(reader: MetaStreamReader, sv: int) -> tuple:
+    """Read one blocked Vector3: [u32 block_size][f32 x][f32 y][f32 z].
+
+    Returns (x, y, z) as a tuple of Python floats.  Block is 16 B total
+    (4 B prefix + 12 B payload).
+    """
+    reader.begin_block()
+    x = reader.read_float32()
+    y = reader.read_float32()
+    z = reader.read_float32()
+    reader.end_block()
+    return (x, y, z)
+
+
+def _decode_u32_blocked(reader: MetaStreamReader, sv: int) -> int:
+    """Read one blocked u32: [u32 block_size][u32 value].  Block is 8 B total."""
+    reader.begin_block()
+    v = reader.read_uint32()
+    reader.end_block()
+    return v
+
+
+# ---------------------------------------------------------------------------
+# PathBase family decoder functions
+# ---------------------------------------------------------------------------
+
+def decode_path_base(reader: MetaStreamReader, stream_version: int) -> PathBase:
+    """Decode PathBase.
+
+    TTL source: Chore.h lines 29-37; MetaInitialize.h lines 1896, 2065.
+    Wire: ZERO bytes.  PathBase is abstract with no serialized members.
+    This decoder is defensive-only (PathBase should never appear as a
+    concrete mPath entry in practice).
+    """
+    return PathBase()
+
+
+def decode_path_segment(reader: MetaStreamReader, stream_version: int) -> PathSegment:
+    """Decode PathSegment.
+
+    TTL source: Chore.h lines 39-56; MetaInitialize.h lines 2069-2075.
+    Wire: 4 blocked members (48 B total):
+        mStart   (16 B: prefix + 3x f32)
+        mEnd     (16 B)
+        mStartNodeId (8 B: prefix + u32)
+        mEndNodeId   (8 B)
+
+    Note: Baseclass_PathBase and ALAIS mStart TTL entries contribute ZERO
+    wire bytes (PathBase has no members; ALAIS is a layout quirk only).
+    """
+    sx, sy, sz = _decode_vector3_blocked(reader, stream_version)
+    ex, ey, ez = _decode_vector3_blocked(reader, stream_version)
+    sn = _decode_u32_blocked(reader, stream_version)
+    en = _decode_u32_blocked(reader, stream_version)
+    return PathSegment(
+        mStart_x=sx, mStart_y=sy, mStart_z=sz,
+        mEnd_x=ex, mEnd_y=ey, mEnd_z=ez,
+        mStartNodeId=sn, mEndNodeId=en,
+    )
+
+
+def decode_hermite(reader: MetaStreamReader, stream_version: int) -> HermiteCurvePathSegment:
+    """Decode HermiteCurvePathSegment.
+
+    TTL source: Chore.h lines 58-75; MetaInitialize.h lines 2078-2086.
+    Wire: 6 blocked members (80 B total):
+        mStart    (16 B)
+        mEnd      (16 B)
+        mStartDir (16 B)
+        mEndDir   (16 B)
+        mStartNodeId (8 B)
+        mEndNodeId   (8 B)
+    """
+    sx, sy, sz = _decode_vector3_blocked(reader, stream_version)
+    ex, ey, ez = _decode_vector3_blocked(reader, stream_version)
+    sdx, sdy, sdz = _decode_vector3_blocked(reader, stream_version)
+    edx, edy, edz = _decode_vector3_blocked(reader, stream_version)
+    sn = _decode_u32_blocked(reader, stream_version)
+    en = _decode_u32_blocked(reader, stream_version)
+    return HermiteCurvePathSegment(
+        mStart_x=sx, mStart_y=sy, mStart_z=sz,
+        mEnd_x=ex, mEnd_y=ey, mEnd_z=ez,
+        mStartDir_x=sdx, mStartDir_y=sdy, mStartDir_z=sdz,
+        mEndDir_x=edx, mEndDir_y=edy, mEndDir_z=edz,
+        mStartNodeId=sn, mEndNodeId=en,
+    )
+
+
+def decode_enum_animated_path_segment_type(
+    reader: MetaStreamReader, stream_version: int
+) -> EnumAnimatedPathSegmentType:
+    """Decode AnimationDrivenPathSegment::EnumAnimatedPathSegmentType.
+
+    TTL source: Chore.h lines 83-92; MetaInitialize.h lines 2089-2097.
+    Wire: 1 blocked member — mVal (long/i32).  Total: 8 B.
+    Called from inside decode_animation_driven's outer mAnimType block.
+    """
+    reader.begin_block()  # inner block for mVal member
+    v = reader.read_int32()
+    reader.end_block()
+    return EnumAnimatedPathSegmentType(mVal=v)
+
+
+def decode_animation_driven(
+    reader: MetaStreamReader, stream_version: int
+) -> AnimationDrivenPathSegment:
+    """Decode AnimationDrivenPathSegment.
+
+    TTL source: Chore.h lines 77-99; MetaInitialize.h lines 2098-2106.
+    Wire: 5 blocked members (76 B total):
+        mStart          (16 B)
+        mEnd            (16 B)
+        mStartDirection (16 B)
+        mEndDirection   (16 B)
+        mAnimType       (12 B: 4 B outer block prefix + 8 B for inner mVal block)
+
+    mAnimType is a nested @meta_class with its OWN block frame:
+        [u32 outer_block_size=12]
+            [u32 mVal_block_size=8]
+            [i32 mVal_value]
+    """
+    sx, sy, sz = _decode_vector3_blocked(reader, stream_version)
+    ex, ey, ez = _decode_vector3_blocked(reader, stream_version)
+    sdx, sdy, sdz = _decode_vector3_blocked(reader, stream_version)
+    edx, edy, edz = _decode_vector3_blocked(reader, stream_version)
+    # mAnimType outer block (wraps the nested EnumAnimatedPathSegmentType)
+    reader.begin_block()
+    anim = decode_enum_animated_path_segment_type(reader, stream_version)
+    reader.end_block()
+    return AnimationDrivenPathSegment(
+        mStart_x=sx, mStart_y=sy, mStart_z=sz,
+        mEnd_x=ex, mEnd_y=ey, mEnd_z=ez,
+        mStartDirection_x=sdx, mStartDirection_y=sdy, mStartDirection_z=sdz,
+        mEndDirection_x=edx, mEndDirection_y=edy, mEndDirection_z=edz,
+        mAnimType=anim,
+    )
+
+
+def decode_walk_path(reader: MetaStreamReader, stream_version: int) -> WalkPath:
+    """Decode WalkPath with polymorphic PathBase dispatch.
+
+    TTL source: Chore.h lines 101-166; MetaInitialize.h lines 2109-2112.
+
+    Step 1 — Default member walker (mName only; mPath has MetaFlag_MetaSerializeDisable):
+        [u32 block_size][u32 mName_len][mName_bytes]
+
+    Step 2 — Custom SERIALIZER (Chore.h lines 119-162):
+        [u32 count]      — INLINE bare u32 (count of PathBase* elements)
+        for i in 0..count:
+            [u64 type_hash]  — INLINE bare u64 (concrete subclass CRC64)
+            PerformMetaSerializeFull(subclass):
+                [u32 outer_block_size][subclass members...]
+
+    On unknown type_hash: logs a warning, calls skip_block() to consume the
+    subclass outer block, appends UnknownPath(type_hash) — NEVER raises.
+    This mirrors the UnknownPropertyValue pattern in meta_propertyset.py.
+    """
+    # Default walker: mName is a blocked String
+    reader.begin_block()
+    name = decode_string(reader, stream_version)
+    reader.end_block()
+
+    # Custom SERIALIZER section: inline u32 count
+    count = reader.read_uint32()
+    paths: list = []
+
+    for _ in range(count):
+        # Inline u64 concrete subclass type hash
+        type_hash = reader.read_uint64()
+        mcd = get_by_hash(type_hash)
+        if mcd is None:
+            log.warning(
+                "decode_walk_path: unknown PathBase subclass hash %#018x — skip_block",
+                type_hash,
+            )
+            reader.skip_block()
+            paths.append(UnknownPath(type_hash=type_hash))
+            continue
+
+        dec = get_decoder_by_hash(type_hash)
+        if dec is None:
+            log.warning(
+                "decode_walk_path: registered but no decoder for %r (%#018x) — skip_block",
+                mcd.name, type_hash,
+            )
+            reader.skip_block()
+            paths.append(UnknownPath(type_hash=type_hash))
+            continue
+
+        # PerformMetaSerializeFull wraps the subclass decoder in begin_block/end_block
+        reader.begin_block()  # outer PerformMetaSerializeFull block
+        paths.append(dec(reader, stream_version))
+        reader.end_block()
+
+    return WalkPath(mName=name, mPath=paths)
+
+
+# ---------------------------------------------------------------------------
+# Registration — Task 1
+# ---------------------------------------------------------------------------
+
+def _register_path_and_walkpath_types() -> None:
+    """Register 6 PathBase-family + WalkPath decoders at import time.
+
+    @meta_class has already populated _REGISTRY with full MetaClassDescription
+    entries (dataclass_cls set, members list populated) for all 6 classes.
+    decoder_only=True preserves those entries while adding to _DECODERS.
+    """
+    register("PathBase",                                                decode_path_base,                       decoder_only=True)
+    register("PathSegment",                                             decode_path_segment,                    decoder_only=True)
+    register("HermiteCurvePathSegment",                                 decode_hermite,                         decoder_only=True)
+    register("AnimationDrivenPathSegment",                              decode_animation_driven,                decoder_only=True)
+    register("AnimationDrivenPathSegment::EnumAnimatedPathSegmentType", decode_enum_animated_path_segment_type, decoder_only=True)
+    register("WalkPath",                                                decode_walk_path,                       decoder_only=True)
+    log.debug("registered 6 PathBase-family + WalkPath decoders")
+
+
+_register_path_and_walkpath_types()
