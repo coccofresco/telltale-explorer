@@ -18,14 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from telltale.crc64 import crc64
-
-# ---------------------------------------------------------------------------
-# MetaStream header magic values (little-endian uint32)
-# ---------------------------------------------------------------------------
-_MAGIC_MBIN = 0x4D42494E  # "MBIN"
-_MAGIC_MTRE = 0x4D545245  # "MTRE"
-_MAGIC_MSV5 = 0x4D535635  # "MSV5"
-_MAGIC_MSV6 = 0x4D535636  # "MSV6"
+from telltale.metastream import parse_header as _ms_parse_header
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -172,50 +165,23 @@ class _Reader:
         return raw.decode("ascii", errors="replace").rstrip("\x00")
 
 
+_METASTREAM_VERSION_INT = {"MBIN": 0, "MTRE": 1, "MSV5": 5, "MSV6": 6}
+
+
 def _parse_metastream_header(r: _Reader) -> int:
     """Parse MetaStream header and return the stream version.
 
-    Returns:
-        0 for MBIN, 1 for MTRE, 5 for MSV5, 6 for MSV6, or -1 for
-        headerless files.  After this call *r.pos* points to the first byte
-        past the header (i.e., the start of actual content).
+    Delegates to ``telltale.metastream.parse_header`` (unified Phase 1
+    infrastructure).  Advances ``r.pos`` to ``header.data_offset`` and
+    returns the legacy integer version code:
+        0 = MBIN, 1 = MTRE, 5 = MSV5, 6 = MSV6, -1 = unrecognised.
     """
-    if r.remaining() < 4:
+    header = _ms_parse_header(r._data)
+    if header.version == "NONE":
+        # Unrecognised magic — leave r.pos at 0 (same as old fallback)
         return -1
-
-    start = r.pos
-    magic = r.u32()
-
-    if magic in (_MAGIC_MBIN, _MAGIC_MTRE):
-        param_count = r.u32()
-        # Peek at next uint32 to decide param style
-        if r.remaining() < 4:
-            return 0 if magic == _MAGIC_MBIN else 1
-        param_hash_check = r.u32()
-        # Seek back 4 because we only peeked
-        r.pos -= 4
-        if 0 < param_hash_check < 128:
-            for _ in range(param_count):
-                name_len = r.u32()
-                r.skip(name_len)  # param name
-                r.skip(4)         # param unknown
-        else:
-            r.skip(12 * param_count)
-        return 0 if magic == _MAGIC_MBIN else 1
-
-    if magic in (_MAGIC_MSV5, _MAGIC_MSV6):
-        _file_size = r.u32()
-        r.skip(8)  # unknown 8 bytes
-        param_count = r.u32()
-        r.skip(12 * param_count)
-        return 5 if magic == _MAGIC_MSV5 else 6
-
-    # Not a recognised magic -- might be a headerless file or a small value
-    if magic <= 128:
-        r.pos = start  # seek back to beginning
-    else:
-        r.pos = start  # try to parse from the start anyway
-    return -1
+    r.pos = header.data_offset
+    return _METASTREAM_VERSION_INT.get(header.version, -1)
 
 
 # ---------------------------------------------------------------------------
