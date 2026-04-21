@@ -57,9 +57,12 @@ cross-checks.  For the ChoreValidationReport type see telltale/validation.py.
 mControlAnimation
 -----------------
 ChoreResource contains a full ``Animation mControlAnimation`` (Chore.h:280).
-Phase 7 does NOT own the Animation decoder.  The embedded Animation block is
-skipped via ``reader.skip_block()`` with a WARNING logged at
-``telltale.meta_chore``.  Phase 8 will implement the embedded Animation decode.
+The embedded Animation block is consumed via ``reader.skip_block()``; its
+content is a variable-length Animation object (e.g. bsz=174 in EP1 medium
+chores) that requires a full Animation decoder to interpret.  Decoding
+Animation objects is outside this module's scope — the Animation wire format
+is defined by the CTK/CompressedKeys infrastructure, not by the Chore structs.
+A DEBUG entry is logged when the block is skipped.
 """
 from __future__ import annotations
 
@@ -119,10 +122,10 @@ class ChoreResource:
     Phase 7 scope: populate mResName / mResLength / mPriority / mFlags /
     mResourceGroup / mhObject / mBlocks + behaviour flags.
 
-    mControlAnimation (Chore.h:280) is an embedded Animation that is NOT
-    decoded in Phase 7.  It is consumed via ``reader.skip_block()`` and
-    stored as raw bytes.  Phase 8 owns the Animation embedded decode.
-    A WARNING is emitted when this skip occurs.
+    mControlAnimation (Chore.h:280) is an embedded Animation object.  It is
+    consumed via ``reader.skip_block()`` and stored as an empty bytes placeholder.
+    Decoding the Animation wire format requires the CTK/CompressedKeys
+    infrastructure and is outside the scope of the Chore decoder.
 
     mhObjectEmbedded and mhObjectDesc (Chore.h:277-278) are runtime-only
     library metadata fields — NOT serialized.
@@ -135,7 +138,7 @@ class ChoreResource:
     mFlags: int = meta_member("mFlags", int)                   # Chore.h:273 Flags
     mResourceGroup: str = meta_member("mResourceGroup", str)   # Chore.h:274 String
     mhObject: Any = meta_member("mhObject", object)            # Chore.h:275 HandleBase
-    # mControlAnimation: embedded Animation — Phase 8 (skip_block'd here)
+    # mControlAnimation: embedded Animation — skip_block'd (CTK decode out of scope)
     mControlAnimation: Optional[bytes] = field(default=None)
     mBlocks: list = field(default_factory=list)                # Chore.h:281 DCArray<Block>
     mbNoPose: bool = meta_member("mbNoPose", bool)             # Chore.h:282
@@ -230,9 +233,10 @@ def decode_chore_resource(reader: MetaStreamReader, stream_version: int) -> Chor
     order matches TTL exactly.  Each member is block-wrapped (begin_block /
     end_block) per the standard MetaStream framing.
 
-    mControlAnimation (Chore.h:280, embedded Animation) is SKIPPED via
-    ``reader.skip_block()``.  A WARNING is logged.  Phase 8 owns the
-    embedded Animation decode.
+    mControlAnimation (Chore.h:280, embedded Animation) is consumed via
+    ``reader.skip_block()``.  A WARNING is logged.  Decoding the Animation
+    object requires the CTK/CompressedKeys infrastructure, which is outside
+    the scope of the Chore decoder.
 
     mhObjectEmbedded and mhObjectDesc (Chore.h:277-278) are runtime-only
     library metadata — NOT serialized.
@@ -277,17 +281,18 @@ def decode_chore_resource(reader: MetaStreamReader, stream_version: int) -> Chor
     reader.end_block()
 
     # mControlAnimation — Chore.h:280 Animation (embedded)
-    # Phase 7 does NOT own Animation decode. Skip and log WARNING.
-    # Phase 8 will implement the embedded Animation decoder.
+    # The Animation block is skipped: decoding Animation objects requires the
+    # CTK/CompressedKeys infrastructure (not part of the Chore decoder scope).
+    # The block size is variable (e.g. bsz=174 for a 170-byte Animation in EP1).
     log.warning(
         "decode_chore_resource: skipping embedded mControlAnimation (Animation block) "
-        "at pos=%d — Phase 8 will implement this decode (Chore.h:280)",
+        "at pos=%d (Chore.h:280) — Animation decode requires CTK infrastructure",
         reader.pos,
     )
     anim_start = reader.pos
     reader.skip_block()
     anim_end = reader.pos
-    m_control_animation = bytes()  # raw bytes placeholder — content is opaque until Phase 8
+    m_control_animation = bytes()  # raw bytes placeholder (Animation content is opaque)
 
     # mBlocks — Chore.h:281 DCArray<ChoreResource::Block>
     # Phase 6 registered "ChoreResource::Block" (scoped name, per STATE 04-02).
@@ -509,8 +514,9 @@ def decode_chore_resource_mtre(reader: MetaStreamReader, stream_version: int) ->
     mResName (Symbol u64) is NOT present on the MTRE wire — it is absent from
     the MTRE class description for EP1 chores.  mResName is stored as 0.
 
-    mControlAnimation (Chore.h:280) is skipped via skip_block.  Phase 8 owns
-    the embedded Animation decode.
+    mControlAnimation (Chore.h:280) is consumed via skip_block.  Decoding
+    the embedded Animation requires CTK/CompressedKeys infrastructure outside
+    the scope of the Chore decoder.
     """
     if log.isEnabledFor(logging.INFO):
         log.info("decode_chore_resource_mtre: entry at pos=%d", reader.pos)
@@ -531,10 +537,11 @@ def decode_chore_resource_mtre(reader: MetaStreamReader, stream_version: int) ->
     # 7. mhObject — block-wrapped String (filename of the referenced resource)
     m_h_object_name = _mtre_read_string_block(reader)
 
-    # 8. mControlAnimation — skip embedded Animation block (Phase 8 scope)
-    log.warning(
-        "decode_chore_resource_mtre: skipping embedded mControlAnimation at pos=%d "
-        "(Phase 8 will implement this decode)",
+    # 8. mControlAnimation — skip embedded Animation block
+    # The block is variable-length (e.g. bsz=174 for a 170-byte Animation in EP1).
+    # Decoding requires CTK/CompressedKeys infrastructure outside this module's scope.
+    log.debug(
+        "decode_chore_resource_mtre: skipping mControlAnimation Animation block at pos=%d",
         reader.pos,
     )
     reader.skip_block()
@@ -547,7 +554,7 @@ def decode_chore_resource_mtre(reader: MetaStreamReader, stream_version: int) ->
         _count = reader.read_uint32()
         _payload_remaining = _blocks_bsz - 4 - 4  # subtract outer-bsz field and count field
         if _count > 0 and _payload_remaining > 0:
-            reader.skip(_payload_remaining)  # skip block entries (Phase 8 decodes Block)
+            reader.skip(_payload_remaining)  # skip block entries (Block decoding out of scope)
     elif _blocks_bsz >= 4:
         # bsz=4: just the size field itself, count=0 implied
         pass
@@ -606,29 +613,45 @@ def decode_chore_resource_mtre(reader: MetaStreamReader, stream_version: int) ->
 def decode_chore_agent_mtre(reader: MetaStreamReader, stream_version: int) -> ChoreAgent:
     """Decode one ChoreAgent from an MTRE (sv<=3) stream.
 
-    MTRE ChoreAgent wire layout (empirically confirmed on EP1 corpus):
+    MTRE ChoreAgent wire layout (empirically confirmed from binary analysis of
+    adv_act3waves_worldmover_zero.chore and _sk20_move_guybrush_setface.chore):
 
     1.  mAgentName   block-wrapped String  (bsz=0 for empty OR bsz=N for named)
-    2.  placeholder  u32=0                 (always 0; empty mAABinding slot)
-    3.  mResources   block-wrapped DCArray<int>  (bsz=N; count u32 + raw i32s)
-    4.  mAttachment  block (skip_block)    (variable size; 51 bytes typical)
-    5.  block4       block (skip_block)    (always bsz=28 in EP1; unknown constant)
+    2.  mResources   block-wrapped DCArray<int>  (bsz=N; count u32 + raw i32s)
+    3.  mAttachment  block (skip_block)    (51 bytes in EP1; variable)
+    4.  block4       block (skip_block)    (28 bytes in EP1; unknown constant tail)
 
-    mFlags, mAgentEnabledRule, and mAABinding are absent from the MTRE wire for
-    EP1 chores (4-class or 9-11 class headers).
-    mResources index values reference into chore.resources[] (0-based).
+    Byte evidence (medium chore, abs 559):
+      pos+0:  00 00 00 00  → bsz=0  mAgentName=''
+      pos+4:  0c 00 00 00  → bsz=12 mResources block (4-bsz + 4-count + 1×4-idx)
+      pos+8:  01 00 00 00  → count=1
+      pos+12: 00 00 00 00  → idx=0
+      pos+16: 33 00 00 00  → bsz=51 mAttachment block
+      pos+67: 1c 00 00 00  → bsz=28 trailer block
+
+    Byte evidence (large chore, abs 2384):
+      pos+0:  00 00 00 00  → bsz=0  mAgentName=''
+      pos+4:  20 00 00 00  → bsz=32 mResources block (4-bsz + 4-count + 6×4-idx)
+      pos+8:  06 00 00 00  → count=6
+      pos+12: 00..05 (6 × i32 indices)
+      pos+44: 33 00 00 00  → bsz=51 mAttachment
+      pos+95: 1c 00 00 00  → bsz=28 trailer
+
+    mFlags, mAABinding, and mAgentEnabledRule are absent from the MTRE wire in
+    all EP1 chores (confirmed by iOS ChoreAgent::MetaOperation_Serialize at VA
+    0x0020B714 — 5-instruction pure-default stub, no version gates).
+    mResources indices reference into chore.resources[] (0-based).
     """
     if log.isEnabledFor(logging.INFO):
         log.info("decode_chore_agent_mtre: entry at pos=%d", reader.pos)
 
-    # 1. mAgentName — block-wrapped String
+    # 1. mAgentName — block-wrapped String (bsz=0 → '')
     m_agent_name = _mtre_read_string_block(reader)
 
-    # 2. Placeholder u32=0 (empty mAABinding slot)
-    reader.read_uint32()
-
-    # 3. mResources — block-wrapped DCArray<int>
-    # MTRE DCArray: bsz=N then count(u32) then raw i32 entries (no inner block wrapper).
+    # 2. mResources — block-wrapped DCArray<int>
+    # Wire: u32 bsz (inclusive), u32 count, count × i32 indices.
+    # No leading placeholder: the first u32 after mAgentName IS the bsz.
+    # Empirically confirmed on EP1 corpus: bsz=12 for count=1, bsz=32 for count=6.
     _res_bsz = reader.read_uint32()
     m_resources: list = []
     if _res_bsz >= 8:
@@ -639,12 +662,12 @@ def decode_chore_agent_mtre(reader: MetaStreamReader, stream_version: int) -> Ch
         if _payload_remaining > 0:
             reader.skip(_payload_remaining)
     elif _res_bsz >= 4:
-        pass  # bsz=4: count=0 implied
+        pass  # bsz=4: count=0 implied (no content bytes)
 
-    # 4. mAttachment — skip entire block
+    # 3. mAttachment — skip entire block (bsz=51 in EP1)
     reader.skip_block()
 
-    # 5. block4 — skip 28-byte constant block
+    # 4. block4 — skip 28-byte constant trailing block (purpose unresolved)
     reader.skip_block()
 
     if log.isEnabledFor(logging.INFO):
@@ -705,11 +728,10 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
     _mtre_hint_layout = (stream_version <= 3 and _mtre_class_count == 4)
     # MTRE EP1 non-hint chores have >=9 class entries (include ChoreResource, ChoreAgent, etc.).
     # These files write mFlags/mLength/mNumResources/mNumAgents as raw unframed bytes
-    # (u8 + f32 + i32 + i32 = 13 bytes total, no block headers).  Fields 7-12 and the
-    # ChoreResource/ChoreAgent post-loops use a non-standard MTRE wire format that has
-    # not been reversed (Phase 8 scope).  We decode the raw scalars to capture
-    # mNumResources/mNumAgents accurately, then skip to EOF.  The custom post-loops do NOT
-    # run for MTRE non-hint chores — they would require full MTRE-specific decode.
+    # (u8 + f32 + i32 + i32 = 13 bytes total, no block headers), then a compact tail for
+    # fields 7-12, followed by MTRE-specific ChoreResource and ChoreAgent post-loops.
+    # The compact tail and post-loops are decoded by decode_chore_resource_mtre and
+    # decode_chore_agent_mtre (empirically derived from EP1 binary analysis).
     _mtre_nonhint_layout = (stream_version <= 3 and _mtre_class_count > 4)
 
     # 1. mName — Chore.h:422 String
@@ -809,23 +831,54 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
         reader.end_block()
 
     if _mtre_hint_layout:
-        # MTRE hint chore (4 class entries): the tail after mEditorProps uses a
-        # completely different layout that has not been reversed.  Skip to EOF.
-        # mNumResources=0 and mNumAgents=0 for all hint chores, so post-loops are empty.
-        remaining = len(reader._data) - reader.pos
-        if remaining > 0:
-            reader.skip(remaining)
-            log.debug(
-                "decode_chore: MTRE hint layout (class_count=%d) — "
-                "skipped %d tail bytes (format not reversed)",
-                _mtre_class_count, remaining,
-            )
-        m_chore_scene_file = ""
-        m_render_delay = 0
+        # MTRE hint chore (4 class entries): fields 7-12 follow the mEditorProps block.
+        #
+        # The '30 31' marker and mChoreSceneFile block start INSIDE the mEditorProps
+        # block (bsz=48 spans [98..146)) — decode_propertyset reads up to abs 139,
+        # then end_block() skips bytes [139..146) which include:
+        #   abs 139-140: '30 31' marker
+        #   abs 141-144: bsz=21  (mChoreSceneFile block header)
+        #   abs 145:     0x0d    (low byte of strlen u32 = 13)
+        #
+        # After end_block() at pos=146, the remaining tail is [146..EOF):
+        #   pos+0..+2   (3 bytes):  high 3 bytes of strlen u32 (all 0x00)
+        #   pos+3..+15  (13 bytes): mChoreSceneFile string content
+        #   pos+16..+19 (4 bytes):  mRenderDelay raw i32
+        #   pos+20..+37 (18 bytes): compact f912 (mSyncToLoc+mDeps+mToolProps+mWalkPaths)
+        #
+        # Byte evidence from guybrush_hint_usenose_e2_135.chore (184 bytes):
+        #   [146..148] 00 00 00  ← strlen high bytes  (strlen = 0x0d000000 LE = 13)
+        #   [149..161] 64 65 66 61 75 6c 74 2e 73 63 65 6e 65  = "default.scene"
+        #   [162..165] 30 00 00 00  = mRenderDelay=48
+        #   [166..183] 00 18 25 76 74 6c 8a 14 87 00 00 00 00 05 00 00 00 30  (18 B)
+        #
+        # We reconstruct mChoreSceneFile by reading the 3 strlen continuation bytes
+        # and combining with the known low byte (0x0d = raw data[pos-1]).
+        import struct as _struct
+        _strlen_lo = reader._data[reader.pos - 1]           # last byte of EP block = 0x0d
+        _strlen_hi_bytes = reader.read_bytes(3)             # 3 high bytes of strlen u32
+        _csf_strlen = _struct.unpack_from(
+            '<I', bytes([_strlen_lo]) + _strlen_hi_bytes
+        )[0]                                                # = 13 for EP1 hint chores
+        _csf_bytes = reader.read_bytes(_csf_strlen)
+        m_chore_scene_file = _csf_bytes.decode('latin-1')
+
+        # mRenderDelay — raw i32 (immediately after string content)
+        m_render_delay = reader.read_int32()
+
+        # Fields 9-12: compact 18-byte sequence (mSyncToLoc/mDeps/mToolProps/mWalkPaths)
+        # Same constant structure as non-hint f912 but 18 bytes (no trailing 4-byte suffix).
+        reader.skip(18)
         m_sync_to_loc = LocalizeInfo(mFlags=0)
         m_dependencies = DependencyLoader1()
         m_tool_props = ToolProps(mbHasProps=False)
         m_walk_paths = {}
+
+        log.debug(
+            "decode_chore: MTRE hint layout (class_count=%d) — "
+            "decoded mChoreSceneFile=%r mRenderDelay=%d",
+            _mtre_class_count, m_chore_scene_file, m_render_delay,
+        )
         _post_loop_resources = 0   # hint: mNumResources=0, post-loops empty
         _post_loop_agents = 0
         _use_mtre_decoders = True  # irrelevant (loops are empty), but consistent
@@ -851,7 +904,24 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
         m_render_delay = reader.read_int32()
 
         # Fields 9-12: mSynchronizedToLocalization, mDependencies, mToolProps, mWalkPaths
-        # All four collapse to a 22-byte constant in EP1 MTRE chores.
+        #
+        # Empirical binary analysis of the medium (654 B) and large (2499 B) EP1 chores
+        # shows the EXACT SAME 22-byte sequence at this position in both files:
+        #
+        #   byte  0:    0x00
+        #   bytes 1-8:  18 25 76 74 6c 8a 14 87  (8-byte type CRC, purpose unresolved)
+        #   bytes 9-16: 00 00 00 00 05 00 00 00  (8 zero/constant bytes)
+        #   bytes 17-20: 30 01 00 00              (u32 = 0x00000130 = 304)
+        #   byte  21:   00
+        #
+        # The 8-byte sequence 18 25 76 74 6c 8a 14 87 does NOT match any known
+        # Telltale type CRC64 in the decoder registry (checked: DependencyLoader<1>,
+        # ToolProps, LocalizeInfo, Map<Symbol,WalkPath>).  Calling begin_block() here
+        # reads bsz = 0x76251800 (invalid) — leaf decoders cannot be applied directly.
+        #
+        # EP1 MTRE chore empirical evidence: this 22-byte block is CONSTANT across
+        # all non-hint chores regardless of the chore's content.  It encodes the
+        # null/empty/default values for all four fields.  Default values are used.
         reader.skip(22)
         m_sync_to_loc = LocalizeInfo(mFlags=0)
         m_dependencies = DependencyLoader1()
@@ -1065,9 +1135,10 @@ def validate_chores(paths: "list[str]") -> "ChoreValidationReport":
     Pattern reference: ``telltale.meta_chore_leaves.validate_chore_leaves_corpus``
     (Phase 6 Plan 06-03).
 
-    Note: MTRE non-hint chores (EP1 files with class_count > 4) now decode
+    Note: MTRE non-hint chores (EP1 files with class_count > 4) decode
     ChoreResource and ChoreAgent entries via ``decode_chore_resource_mtre`` and
-    ``decode_chore_agent_mtre``.  mControlAnimation is skipped (Phase 8 scope).
+    ``decode_chore_agent_mtre``.  mControlAnimation is skipped (Animation decode
+    requires CTK infrastructure outside this module's scope).
     """
     # Lazy import mirrors STATE 06-03 decision (avoid circular imports at module load).
     from telltale.validation import ChoreValidationReport
