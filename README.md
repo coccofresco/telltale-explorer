@@ -16,7 +16,8 @@ with focus on **Tales of Monkey Island** (2009) and the D3DMESH V1 format era.
   (`SingleValue<T>`, `CompressedKeys<Vector3/Quaternion/Transform/float/Bool>`,
   `CompressedTransformKeys`, `CompressedPhonemeKeys`, …) decoded with per-sample values
 - **`.ptable` (phoneme table) decoder** — closes the lip-sync pipeline
-- **`.chore` surface inspector** — extract the resource-handle graph from any chore file
+- **`.chore` full structural decoder** — every field of every nested sub-struct decoded into Python dataclasses; 1929/1929 Tales of Monkey Island EP1 chores parse cleanly
+- **Generic MetaStream + MetaClass reflection reader** — reusable block-safe reader with CRC64-keyed type registry, primitive / math / Handle / container / PropertySet / Chore-leaf decoders; ready for `.scene` / `.prop` / other Telltale formats
 
 ## Quick Start
 
@@ -68,7 +69,10 @@ python parse_ptable.py path/to/sk03_elaine.ptable
 ### Choreography
 
 ```bash
-# Surface-level chore inspection: name + referenced resources
+# Full structural decode: 12 top-level fields + ChoreResource / ChoreAgent loops
+python -c "from telltale.chore import parse_chore; c = parse_chore('file.chore'); print(c)"
+
+# Handle-graph inspection (rewritten on parse_chore — strict superset of v1.1 output)
 python inspect_chore.py path/to/file.chore
 ```
 
@@ -92,7 +96,8 @@ Format specifications and script reference live under [`docs/`](docs/):
 - [`docs/FORMAT_SKELETON.md`](docs/FORMAT_SKELETON.md) — `.skl` skeleton layout
 - [`docs/FORMAT_ANIMATION.md`](docs/FORMAT_ANIMATION.md) — `.anm` container + every value-type wire format
 - [`docs/FORMAT_PHONEME_TABLE.md`](docs/FORMAT_PHONEME_TABLE.md) — `.ptable` schema + lip-sync pipeline
-- [`docs/FORMAT_CHOREOGRAPHY.md`](docs/FORMAT_CHOREOGRAPHY.md) — `.chore` schema + surface-inspector scope
+- [`docs/FORMAT_CHOREOGRAPHY.md`](docs/FORMAT_CHOREOGRAPHY.md) — `.chore` full schema (MetaStream + MetaClass + 12 Chore fields + 21 ChoreResource + 7 ChoreAgent + PropertySet + leaves)
+- [`docs/CHORE_DISASM.md`](docs/CHORE_DISASM.md) — iOS ARM32 disasm artifact for `Chore::MetaOperation_Serialize` (VA `0x00205788`)
 - [`docs/SCRIPTS.md`](docs/SCRIPTS.md) — CLI / module overview
 - [`CONTRIBUTION_RTB.md`](CONTRIBUTION_RTB.md) — D3DMESH V1 format spec (submitted to [RTB-3DSMax-Scripts#9](https://github.com/RandomTBush/RTB-3DSMax-Scripts/issues/9))
 
@@ -113,16 +118,30 @@ parse_ctk.py                 CompressedTransformKeys / CompressedPhonemeKeys dec
 parse_compressed_keys.py     CompressedKeys<Vector3/Quaternion/Transform> decoders
 parse_anm_values.py          Multi-value .anm walker (routes every type to its decoder)
 parse_ptable.py              PhonemeTable (.ptable) decoder
-inspect_chore.py             .chore surface inspector (handle graph)
+inspect_chore.py             .chore handle-graph inspector (built on telltale.chore)
+
+scripts/
+  disasm_chore.py            iOS ARM32 disasm tool (capstone) — Chore::MetaOperation_Serialize
 
 telltale/                    Library modules
   ttarch.py                  TTARCH archive reader + Blowfish key DB
-  metastream.py              MetaStream (ERTM/MSV5/MSV6) header parser
+  metastream.py              MetaStream container + MetaStreamReader (block-stack, format_version)
+  metaclass.py               CRC64-keyed @meta_class / meta_member registry + version gating
+  meta_intrinsics.py         bool / int* / uint* / float / double / Flags / Symbol / String decoders
+  meta_math.py               Vector2/3/4, Quaternion, Color, Transform (iOS 28 B layout)
+  meta_handle.py             Handle<T> MTRE / MSV5+ version-branching decoder (11 template params)
+  meta_containers.py         DCArray / Map / Set / SArray / List dispatcher with nested templates
+  meta_propertyset.py        PropertySet FORMAT A/B decoder + KeyframedValue<T> wrappers
+  meta_ptable.py             PhonemeTable::PhonemeEntry + AnimOrChore decoders
+  meta_chore_leaves.py       16 Chore leaf types (LocalizeInfo, DependencyLoader, ToolProps, WalkPath, Rule, ...)
+  meta_chore.py              Chore / ChoreResource / ChoreAgent + decode_chore + parse_chore + validate_chores
+  chore.py                   Public API: parse_chore, Chore, ChoreResource, ChoreAgent, extract_handles
+  validation.py              ChoreValidationReport (corpus-wide clean / misalignment tracking)
   d3dmesh.py                 D3DMESH format helpers
   d3dtx.py                   D3DTX format helpers
   blowfish.py                Blowfish encryption for TTARCH
   crc64.py                   CRC64 ECMA-182 hashing (case-insensitive for Symbols)
-  skeleton.py                .skl skeleton parser
+  skeleton.py                .skl skeleton parser (rewired onto MetaStreamReader in v1.2)
 ```
 
 ## Roadmap
@@ -138,8 +157,9 @@ telltale/                    Library modules
 - [x] Full multi-value .anm walker (99.9 % EP1 coverage)
 - [x] Phoneme table (.ptable) decoder
 - [x] Choreography (.chore) surface inspection
+- [x] Full `.chore` structural decoder (nested PropertySet / HandleObjectInfo) — 1929/1929 EP1 clean
+- [x] Generic MetaStream + MetaClass reflection reader
 - [ ] `CompressedVector3Keys2` inner bit-stream
-- [ ] Full `.chore` structural decoder (nested PropertySet / HandleObjectInfo)
 - [ ] Scene (.scene) + props (.prop) → glTF scene graph
 
 ## Credits
