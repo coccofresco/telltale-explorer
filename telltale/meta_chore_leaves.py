@@ -842,3 +842,329 @@ def _register_path_and_walkpath_types() -> None:
 
 
 _register_path_and_walkpath_types()
+
+
+# ========================================================================
+# Plan 06-02 Task 2: LogicItem + LogicGroup + Rule decoders
+# ========================================================================
+#
+# TTL sources:
+#   LogicGroup::LogicItem — Rules.h lines 17-22;  MetaInitialize.h lines 1940-1948
+#   LogicGroup            — Rules.h lines 15-31;  MetaInitialize.h lines 1955-1961
+#   Rule                  — Rules.h lines 33-49;  MetaInitialize.h lines 1964-1974
+# ========================================================================
+
+
+# ---------------------------------------------------------------------------
+# LogicItem / LogicGroup / Rule dataclasses
+# ---------------------------------------------------------------------------
+
+@meta_class("LogicGroup::LogicItem")
+@dataclass
+class LogicItem:
+    """LogicGroup::LogicItem — Rules.h lines 17-22; MetaInitialize.h lines 1940-1948.
+
+    Inherits PropertySet.  Wire (FIRSTMEM is Baseclass_PropertySet):
+        PropertySet content (inline — decode_propertyset called first)
+        mName              (blocked String)
+        mKeyNegateList     (blocked Map<Symbol, bool>)
+        mKeyComparisonList (blocked Map<Symbol, i32>)
+        mKeyActionList     (blocked Map<Symbol, i32>)
+        mReferenceKeyList  (blocked DCArray<String>)
+
+    mProps stores the decoded PropertySet superclass state (opaque blob).
+    It is NOT a meta_member (not in the members list); only the 5 own
+    members below are reflected.
+    """
+    mName: str = meta_member("mName", str)
+    mKeyNegateList: dict = meta_member("mKeyNegateList", dict)
+    mKeyComparisonList: dict = meta_member("mKeyComparisonList", dict)
+    mKeyActionList: dict = meta_member("mKeyActionList", dict)
+    mReferenceKeyList: list = meta_member("mReferenceKeyList", list)
+    mProps: Any = field(default=None)  # PropertySet superclass — runtime-only
+
+
+@meta_class("LogicGroup")
+@dataclass
+class LogicGroup:
+    """LogicGroup — Rules.h lines 15-31; MetaInitialize.h lines 1955-1961.
+
+    Wire: 6 blocked members in TTL declaration order:
+        mOperator     (i32)
+        mItems        (Map<String, LogicItem>)
+        mLogicGroups  (DCArray<LogicGroup>)  — RECURSIVE
+        mGroupOperator (i32)
+        mType         (i32)
+        mName         (String)
+
+    Recursion in mLogicGroups terminates when count == 0.
+    """
+    mOperator: int = meta_member("mOperator", int)
+    mItems: dict = meta_member("mItems", dict)
+    mLogicGroups: list = meta_member("mLogicGroups", list)
+    mGroupOperator: int = meta_member("mGroupOperator", int)
+    mType: int = meta_member("mType", int)
+    mName: str = meta_member("mName", str)
+
+
+@meta_class("Rule")
+@dataclass
+class Rule:
+    """Rule — Rules.h lines 33-49; MetaInitialize.h lines 1964-1974.
+
+    Wire: 7 blocked members in TTL declaration order:
+        mName            (String)
+        mRuntimePropName (String)
+        mFlags           (Flags/u32)
+        mConditions      (LogicGroup)
+        mActions         (LogicGroup)
+        mElse            (LogicGroup)
+        mAgentCategory   (String)
+    """
+    mName: str = meta_member("mName", str)
+    mRuntimePropName: str = meta_member("mRuntimePropName", str)
+    mFlags: int = meta_member("mFlags", int)
+    mConditions: LogicGroup = meta_member("mConditions", object)
+    mActions: LogicGroup = meta_member("mActions", object)
+    mElse: LogicGroup = meta_member("mElse", object)
+    mAgentCategory: str = meta_member("mAgentCategory", str)
+
+
+# ---------------------------------------------------------------------------
+# Private helpers — Map and DCArray variants for LogicItem members
+# ---------------------------------------------------------------------------
+
+def _decode_map_symbol_bool(reader: MetaStreamReader, sv: int) -> dict:
+    """Decode Map<Symbol, bool>: [u32 count][count*(Symbol, u8)].
+
+    Map.h frame: count + alternating key/value pairs with NO block wrapper.
+    In MTRE (sv <= 4), Symbol keys in Map carry a trailing debug u32=0.
+    See meta_intrinsics.decode_symbol and meta_containers.decode_map.
+    """
+    count = reader.read_uint32()
+    out: dict = {}
+    for _ in range(count):
+        k = decode_symbol(reader, sv, include_mtre_debug_strlen=(sv <= 4))
+        v = reader.read_uint8() != 0
+        out[k] = v
+    return out
+
+
+def _decode_map_symbol_i32(reader: MetaStreamReader, sv: int) -> dict:
+    """Decode Map<Symbol, int>: [u32 count][count*(Symbol, i32)].
+
+    Same Map.h frame as _decode_map_symbol_bool but with i32 values.
+    Used for both mKeyComparisonList and mKeyActionList (Map<Symbol, int>).
+    """
+    count = reader.read_uint32()
+    out: dict = {}
+    for _ in range(count):
+        k = decode_symbol(reader, sv, include_mtre_debug_strlen=(sv <= 4))
+        v = reader.read_int32()
+        out[k] = v
+    return out
+
+
+def _decode_map_string_logicitem(reader: MetaStreamReader, sv: int) -> dict:
+    """Decode Map<String, LogicItem>: [u32 count][count*(String, LogicItem)].
+
+    String keys have no debug-strlen artifact (Symbol-key only).
+    decode_logic_item handles the LogicItem superclass + own members inline.
+    """
+    count = reader.read_uint32()
+    out: dict = {}
+    for _ in range(count):
+        k = decode_string(reader, sv)
+        v = decode_logic_item(reader, sv)
+        out[k] = v
+    return out
+
+
+def _decode_dcarray_string(reader: MetaStreamReader, sv: int) -> list:
+    """Decode DCArray<String> via the Phase 4 dispatch_container path."""
+    result = dispatch_container("DCArray<String>", reader, sv)
+    return result if result is not None else []
+
+
+# ---------------------------------------------------------------------------
+# LogicItem / LogicGroup / Rule decoder functions
+# ---------------------------------------------------------------------------
+
+def decode_logic_item(reader: MetaStreamReader, stream_version: int) -> LogicItem:
+    """Decode LogicGroup::LogicItem.
+
+    TTL source: Rules.h lines 17-22; MetaInitialize.h lines 1940-1948.
+
+    FIRSTMEM is Baseclass_PropertySet — decode_propertyset is called first
+    to consume the inherited PropertySet content inline (no separate outer
+    block; PropertySet manages its own framing).
+
+    Then LogicItem's own 5 members, each block-wrapped:
+        mName              (blocked String)
+        mKeyNegateList     (blocked Map<Symbol, bool>)
+        mKeyComparisonList (blocked Map<Symbol, i32>)
+        mKeyActionList     (blocked Map<Symbol, i32>)
+        mReferenceKeyList  (blocked DCArray<String>)
+    """
+    # Superclass PropertySet content (manages own framing — no outer block)
+    base_propset = decode_propertyset(reader, stream_version)
+
+    # Own members (each individually block-wrapped)
+    reader.begin_block()
+    name = decode_string(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    neg = _decode_map_symbol_bool(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    cmp_ = _decode_map_symbol_i32(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    act = _decode_map_symbol_i32(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    ref = _decode_dcarray_string(reader, stream_version)
+    reader.end_block()
+
+    return LogicItem(
+        mName=name,
+        mKeyNegateList=neg,
+        mKeyComparisonList=cmp_,
+        mKeyActionList=act,
+        mReferenceKeyList=ref,
+        mProps=base_propset,
+    )
+
+
+def decode_logic_group(reader: MetaStreamReader, stream_version: int) -> LogicGroup:
+    """Decode LogicGroup.
+
+    TTL source: Rules.h lines 15-31; MetaInitialize.h lines 1955-1961.
+    Wire: 6 blocked members in TTL declaration order:
+
+        mOperator     (blocked i32)
+        mItems        (blocked Map<String, LogicItem>)
+        mLogicGroups  (blocked DCArray<LogicGroup>) — RECURSIVE:
+                        [u32 outer_block_size]
+                            [u32 count]
+                            [u32 inner_block_size]
+                            count * LogicGroup
+        mGroupOperator (blocked i32)
+        mType         (blocked i32)
+        mName         (blocked String)
+
+    Recursion terminates when count == 0 (empty mLogicGroups).
+    decode_dcarray wire frame: [u32 count][u32 inner_block][elements...]
+    The outer mLogicGroups block wraps the entire DCArray frame.
+    """
+    reader.begin_block()
+    op = reader.read_int32()
+    reader.end_block()
+
+    reader.begin_block()
+    items = _decode_map_string_logicitem(reader, stream_version)
+    reader.end_block()
+
+    # mLogicGroups: outer block wraps DCArray frame (count + inner block + elements)
+    reader.begin_block()
+    count = reader.read_uint32()
+    reader.begin_block()  # DCArray inner elements block
+    sub = [decode_logic_group(reader, stream_version) for _ in range(count)]
+    reader.end_block()
+    reader.end_block()
+
+    reader.begin_block()
+    group_op = reader.read_int32()
+    reader.end_block()
+
+    reader.begin_block()
+    ty = reader.read_int32()
+    reader.end_block()
+
+    reader.begin_block()
+    nm = decode_string(reader, stream_version)
+    reader.end_block()
+
+    return LogicGroup(
+        mOperator=op,
+        mItems=items,
+        mLogicGroups=sub,
+        mGroupOperator=group_op,
+        mType=ty,
+        mName=nm,
+    )
+
+
+def decode_rule(reader: MetaStreamReader, stream_version: int) -> Rule:
+    """Decode Rule.
+
+    TTL source: Rules.h lines 33-49; MetaInitialize.h lines 1964-1974.
+    Wire: 7 blocked members in TTL declaration order:
+        mName            (blocked String)
+        mRuntimePropName (blocked String)
+        mFlags           (blocked Flags/u32)
+        mConditions      (blocked LogicGroup)
+        mActions         (blocked LogicGroup)
+        mElse            (blocked LogicGroup)
+        mAgentCategory   (blocked String)
+    """
+    reader.begin_block()
+    name = decode_string(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    rt_name = decode_string(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    flags = reader.read_uint32()
+    reader.end_block()
+
+    reader.begin_block()
+    cond = decode_logic_group(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    acts = decode_logic_group(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    els = decode_logic_group(reader, stream_version)
+    reader.end_block()
+
+    reader.begin_block()
+    ag_cat = decode_string(reader, stream_version)
+    reader.end_block()
+
+    return Rule(
+        mName=name,
+        mRuntimePropName=rt_name,
+        mFlags=flags,
+        mConditions=cond,
+        mActions=acts,
+        mElse=els,
+        mAgentCategory=ag_cat,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registration — Task 2
+# ---------------------------------------------------------------------------
+
+def _register_logic_and_rule_types() -> None:
+    """Register LogicItem, LogicGroup, and Rule decoders at import time.
+
+    @meta_class has already populated _REGISTRY.  decoder_only=True
+    preserves existing dataclass_cls bindings.
+    """
+    register("LogicGroup::LogicItem", decode_logic_item,  decoder_only=True)
+    register("LogicGroup",            decode_logic_group, decoder_only=True)
+    register("Rule",                  decode_rule,        decoder_only=True)
+    log.debug("registered LogicItem + LogicGroup + Rule decoders")
+
+
+_register_logic_and_rule_types()
