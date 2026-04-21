@@ -517,12 +517,20 @@ class MetaStreamReader:
         """Read a ``uint32 block_size`` and push ``(start, end_abs)``.
 
         ``start`` is the position BEFORE the size prefix; ``end_abs`` is
-        ``start + block_size``.  After this call the position sits just
-        past the size prefix, at the beginning of the block payload.
+        ``start + block_size``, clamped to a minimum of ``start + 4`` so
+        that the post-header position is never rewound on ``end_block()``.
+
+        MTRE files occasionally encode a ``block_size`` of 0 or 1 for empty
+        leaf-struct blocks (e.g. AutoActStatus with no name).  Without the
+        clamp, ``end_abs`` would be *before* the position at which the 4-byte
+        size field was read, causing ``end_block()`` to seek backwards and
+        corrupt subsequent reads.  The clamp is a no-op for all well-formed
+        blocks where ``block_size >= 4``.
         """
         start = self.pos
         block_size = self.read_uint32()
-        end_abs = start + block_size
+        # Clamp: end_abs must be at least start+4 (the post-size-field position).
+        end_abs = max(start + 4, start + block_size)
         self._block_stack.append((start, end_abs))
         return (start, end_abs)
 
@@ -552,12 +560,14 @@ class MetaStreamReader:
         """Read a block's size prefix and jump to its end without decoding.
 
         Does NOT push onto the block stack.  Returns the absolute end
-        position (``start + block_size``).  This is the INFRA-04 skip-
-        unknown-member primitive.
+        position (clamped to at least ``start + 4`` so the post-size-field
+        position is never rewound).  This is the INFRA-04 skip-unknown-member
+        primitive.  The clamp mirrors the one in ``begin_block`` and handles
+        MTRE blocks with block_size < 4 (e.g. 0 or 1).
         """
         start = self.pos
         block_size = self.read_uint32()
-        end_abs = start + block_size
+        end_abs = max(start + 4, start + block_size)
         self.seek(end_abs)
         return end_abs
 
