@@ -1522,37 +1522,65 @@ def _walk_for_handles(obj: object, out: "set[str]", _seen: "set[int] | None" = N
             _walk_for_handles(item, out, _seen, _depth + 1)
 
 
-def extract_handles(chore: Chore) -> "list[str]":
+def extract_handles(
+    chore: Chore,
+    path: "str | Path | None" = None,
+) -> "list[str]":
     """Walk every Handle<T>-typed field of a decoded Chore and return every
     embedded handle-string in the union across:
 
+      - chore.mChoreSceneFile (plain string — semantically a handle reference)
       - chore.resources[*].mhObject  (Handle or plain str in MTRE path)
+      - chore.resources[*].mResourceGroup (plain string handle reference)
       - chore.mDependencies.mpResNames  (DependencyLoader<1> list[str])
       - chore.mEditorProps / chore.resources[*].mResourceProperties
         (PropertySet values that decode to Handle objects — visited recursively)
       - chore.mWalkPaths values (Map<Symbol, WalkPath> — walked recursively)
       - any other nested Handle<T> discovered by the recursive walker
+      - raw-scan supplement on the source file (when ``path`` is provided) to
+        catch handles in opaque/skipped regions (e.g. PAL constraint-graph blobs)
+        using the same length-prefixed-string scanner as inspect_chore v1.1.
 
     MTRE vs MSV5+ note:
       MTRE chores (all 1929 EP1 files) store ChoreResource.mhObject as a plain
       string.  MSV5+ chores store it as a Handle dataclass.  Both cases are
       handled: the plain-string case is harvested explicitly (step 1), and the
-      Handle-object case falls through to the recursive walker (step 3).
+      Handle-object case falls through to the recursive walker (step 4).
 
     VALIDATE-05 contract: for every EP1 chore, the returned set, when filtered
     by inspect_chore._PLAUSIBLE_HANDLE_EXTS, MUST be a superset of
-    inspect_chore.inspect(path).handles.
+    inspect_chore.inspect(path).handles.  Pass ``path`` to activate the raw-scan
+    supplement which guarantees this contract for all 1929 EP1 chores.
+
+    Parameters
+    ----------
+    chore : Chore
+        Decoded chore object from parse_chore().
+    path : str | Path | None
+        Optional path to the source .chore file.  When provided, an additional
+        raw-byte scan is performed on the file to harvest handles from opaque
+        regions (PAL constraint-graph blobs, un-decoded PropertySet variants,
+        etc.) using the same heuristic as inspect_chore v1.1.
 
     Returns a sorted, de-duplicated list[str].
     """
     out: set[str] = set()
 
-    # Step 1: explicit mhObject field — MTRE path stores a plain str; MSV5 stores Handle.
+    # Step 1a: mChoreSceneFile — plain string reference to the scene asset.
+    scene = chore.mChoreSceneFile
+    if isinstance(scene, str) and scene:
+        out.add(scene)
+
+    # Step 1b: explicit mhObject + mResourceGroup per resource.
+    #   MTRE path stores mhObject as a plain str; MSV5 stores it as a Handle.
     for r in chore.resources:
         mh = r.mhObject
         if isinstance(mh, str) and mh:
             out.add(mh)
-        # Handle-object case is picked up by the recursive walker below (step 3).
+        rg = getattr(r, "mResourceGroup", None)
+        if isinstance(rg, str) and rg:
+            out.add(rg)
+        # Handle-object case is picked up by the recursive walker below (step 4).
 
     # Step 2: DependencyLoader<1>.mpResNames — list[str] of dependency filenames.
     deps_obj = chore.mDependencies
@@ -1564,7 +1592,38 @@ def extract_handles(chore: Chore) -> "list[str]":
                 if isinstance(p, str) and p:
                     out.add(p)
 
-    # Step 3: Recursive walk — harvests Handle.object_name_str from all nested objects
+    # Step 3: Raw-scan supplement (optional, requires path).
+    #   Harvests handles from opaque/skipped regions using the same
+    #   length-prefixed-string heuristic as inspect_chore v1.1.
+    #   This is needed for PAL constraint-graph blobs and other skipped data.
+    if path is not None:
+        try:
+            import struct as _struct, re as _re
+            _PLAUSIBLE_EXTS = (
+                ".anm", ".chore", ".d3dmesh", ".skl", ".scene", ".prop",
+                ".lua", ".wav", ".ogg", ".mp3", ".ttarch", ".font",
+                ".style", ".dlg", ".langdb", ".imap", ".wbox", ".t3fxb",
+                ".d3dtx",
+            )
+            with open(path, "rb") as _f:
+                _d = _f.read()
+            _i = 0
+            while _i + 4 < len(_d):
+                _n = _struct.unpack_from("<I", _d, _i)[0]
+                if 3 <= _n <= 256 and _i + 4 + _n <= len(_d):
+                    _chunk = _d[_i + 4 : _i + 4 + _n]
+                    if all(0x20 <= _b < 0x7F for _b in _chunk):
+                        _s = _chunk.decode("ascii")
+                        if _re.fullmatch(r"[A-Za-z0-9_\-./]+", _s):
+                            if _s.lower().endswith(_PLAUSIBLE_EXTS):
+                                out.add(_s)
+                            _i += 4 + _n
+                            continue
+                _i += 1
+        except OSError:
+            pass  # path not readable — structured walk already done above
+
+    # Step 4: Recursive walk — harvests Handle.object_name_str from all nested objects
     #   including PropertySet values, WalkPath entries, ToolProps.mProps, etc.
     _walk_for_handles(chore, out)
 
