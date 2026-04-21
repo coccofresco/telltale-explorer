@@ -175,6 +175,8 @@ MAGIC_MTRE = struct.unpack("<I", b"ERTM")[0]   # 0x4D545245
 MAGIC_MSV5 = struct.unpack("<I", b"5VSM")[0]   # 0x4D535635
 MAGIC_MSV6 = struct.unpack("<I", b"6VSM")[0]   # 0x4D535636
 
+_FORMAT_VERSION_INTS = {"MBIN": 1, "MTRE": 3, "MSV5": 5, "MSV6": 6}
+
 # Lookup by raw 4-byte magic (both natural and reversed orderings) for
 # convenience when the caller has raw bytes instead of a uint32.
 MAGICS_BY_BYTES = {
@@ -457,14 +459,27 @@ class MetaStreamReader:
 
     @property
     def stream_version(self) -> int:
-        """Version of the first class declared in the header, or -1 if none.
+        """Version CRC of the first class declared in the header, or -1 if none.
 
-        Phase 2's ``Meta_IsMemberDisabled`` + ``min_meta_version`` dispatch
-        consumes this.
+        This is the per-class ``SerializedVersionInfo`` CRC used by Phase 2's
+        ``Meta_IsMemberDisabled`` + ``min_meta_version`` dispatch — NOT the
+        MetaStream container format version (MTRE/MSV5/MSV6). For that, use
+        :attr:`format_version`.
         """
         if self.header.classes:
             return self.header.classes[0][1]
         return -1
+
+    @property
+    def format_version(self) -> int:
+        """Integer code for the MetaStream container format.
+
+        Returns ``1`` for ``MBIN``, ``3`` for ``MTRE`` (ERTM), ``5`` for
+        ``MSV5``, ``6`` for ``MSV6``, or ``-1`` for unrecognised. This is the
+        version that drives container-level framing decisions (e.g. Map
+        Symbol-key trailing-u32 debug-strlen in MTRE where format_version <= 4).
+        """
+        return _FORMAT_VERSION_INTS.get(self.header.version, -1)
 
     # -- primitive reads (delegated) ------------------------------------
 
