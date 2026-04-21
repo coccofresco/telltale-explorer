@@ -67,6 +67,7 @@ A DEBUG entry is logged when the block is skipped.
 from __future__ import annotations
 
 import logging
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
@@ -478,7 +479,14 @@ def _mtre_read_string_block(reader: MetaStreamReader) -> str:
     return raw.decode("latin-1")
 
 
-def decode_chore_resource_mtre(reader: MetaStreamReader, stream_version: int) -> ChoreResource:
+def decode_chore_resource_mtre(
+    reader: MetaStreamReader,
+    stream_version: int,
+    *,
+    _num_agents: int = 0,
+    _remaining_resources: int = 1,
+    _pal_skip_out: "list[int] | None" = None,
+) -> ChoreResource:
     """Decode one ChoreResource from an MTRE (sv<=3) stream.
 
     MTRE fields are NOT wrapped in individual begin_block/end_block pairs the
@@ -577,9 +585,156 @@ def decode_chore_resource_mtre(reader: MetaStreamReader, stream_version: int) ->
     reader.skip_block()
 
     # 20. mAAStatus tail: [u32=0 placeholder][inner_bsz][if inner_bsz>=4: (inner_bsz-4) bytes]
+    #
+    # For most resources: outer=0, inner_bsz=1 (8 bytes total) or inner_bsz=18 (22 bytes total).
+    # For "Procedural Look At" (PAL) resources: inner_bsz=0xcc33a947 (first 4 bytes of a type CRC
+    # embedded in the PAL serialized data).  The PAL mAAStatus encodes a full constraint graph
+    # whose schema is unknown; its size varies from ~100 to ~8000 bytes across EP1 files.
+    #
+    # PAL detection: inner_bsz > 0xFFFF (no valid MTRE block exceeds 64 KB).  When detected,
+    # scan forward for the next valid structure boundary (next resource's mResourceGroup block
+    # OR next agent's mAgentName block), both of which start with a small bsz u32 (≤512)
+    # followed by a small strlen u32 (≤256) and printable ASCII bytes (or bsz=0 for anonymous
+    # agent).  The scan consumes exactly the bytes needed to reach that boundary.
     _outer_placeholder = reader.read_uint32()   # always 0
     _inner_bsz = reader.read_uint32()
-    if _inner_bsz >= 4:
+    if _inner_bsz > 0xFFFF:
+        # PAL resource: skip variable-length mAAStatus by scanning for the next block boundary.
+        #
+        # The "Procedural Look At" (PAL) constraint graph is serialized as an opaque blob
+        # whose size ranges from ~100 to ~8000+ bytes.  The inner_bsz field (which should
+        # encode the mAAStatus payload size) instead contains the first 4 bytes of a type
+        # CRC (0xcc33a947), making naive size-directed parsing impossible.
+        #
+        # Strategy: scan forward from the current position looking for the start of the
+        # NEXT structure (either the next resource's mResourceGroup block or the first
+        # agent's mAgentName block).  When _num_agents > 0 (the caller has told us how
+        # many agents follow ALL resources), use the strongest possible check: simulate
+        # decoding ALL _num_agents agents sequentially from the candidate position and
+        # require that the chain ends exactly at the file end.  When _num_agents == 0
+        # (caller did not supply the count), fall back to single-agent simulation.
+        _scan_data = reader._data
+        _scan_start = reader.pos
+        _scan_end = len(_scan_data)
+        _skipped = _scan_end - _scan_start  # default: skip to EOF
+
+        def _valid_dcarray_bsz(v: int) -> bool:
+            """True if *v* is a plausible DCArray<int> block-size (bsz includes itself)."""
+            return v == 4 or (v >= 8 and (v - 8) % 4 == 0 and v <= 2048)
+
+        def _simulate_one_agent(pos: int) -> int:
+            """Simulate one ChoreAgent decode at *pos*.  Returns end pos, or -1 on failure.
+
+            ChoreAgent MTRE wire layout (bsz values include the bsz field itself):
+                mAgentName bsz  (u32; 0=anonymous, bsz>=8 for named)
+                [named: strlen(u32) + ASCII chars + padding]
+                [mFlags (u32) — present only when peek_after_name is NOT a valid DCArray bsz]
+                mResources bsz  (u32; valid DCArray bsz)
+                [count(u32) + count×i32 indices]
+                mAttachment:    skip_block (bsz includes itself, consumed = bsz bytes)
+                trailing block: skip_block (bsz includes itself, consumed = bsz bytes)
+
+            Limits are deliberately generous to accommodate large cutscene chores with
+            hundreds of resources (demo_cs files: mNumResources=340, mNumAgents=122;
+            agents can reference 300+ resources requiring res_bsz>1200).
+            The exact DCArray count check (count == (res_bsz-8)//4) prevents false positives
+            even with generous size limits.
+            """
+            if pos + 4 > _scan_end:
+                return -1
+            name_bsz = struct.unpack_from("<I", _scan_data, pos)[0]
+            if name_bsz == 0:
+                # Anonymous agent: bsz=0 → only the 4-byte bsz field consumed.
+                after_name = pos + 4
+            elif 8 <= name_bsz <= 512:
+                # Named agent: _mtre_read_string_block consumes exactly name_bsz bytes
+                # (bsz is self-inclusive: 4-byte bsz field + (bsz-4) content bytes).
+                if pos + 8 > _scan_end:
+                    return -1
+                strlen = struct.unpack_from("<I", _scan_data, pos + 4)[0]
+                if strlen > 256 or strlen + 8 > name_bsz or pos + 8 + strlen > _scan_end:
+                    return -1
+                text = _scan_data[pos + 8: pos + 8 + strlen]
+                if strlen > 0 and not all(0x20 <= b < 0x7F for b in text):
+                    return -1
+                after_name = pos + name_bsz  # bsz is self-inclusive
+            else:
+                return -1
+            if after_name + 4 > _scan_end:
+                return -1
+            peek = struct.unpack_from("<I", _scan_data, after_name)[0]
+            res_pos = after_name if _valid_dcarray_bsz(peek) else after_name + 4
+            if res_pos + 4 > _scan_end:
+                return -1
+            res_bsz = struct.unpack_from("<I", _scan_data, res_pos)[0]
+            if not _valid_dcarray_bsz(res_bsz):
+                return -1
+            if res_bsz >= 8:
+                if res_pos + 8 > _scan_end:
+                    return -1
+                count = struct.unpack_from("<I", _scan_data, res_pos + 4)[0]
+                # Exact DCArray count check: bsz = 8 + count*4 exactly.
+                if count != (res_bsz - 8) // 4 or count > 4096 or res_pos + res_bsz > _scan_end:
+                    return -1
+            att_pos = res_pos + res_bsz
+            if att_pos + 4 > _scan_end:
+                return -1
+            att_bsz = struct.unpack_from("<I", _scan_data, att_pos)[0]
+            if att_bsz < 4 or att_bsz > 65536:
+                return -1
+            trail_pos = att_pos + att_bsz
+            if trail_pos + 4 > _scan_end:
+                return -1
+            trail_bsz = struct.unpack_from("<I", _scan_data, trail_pos)[0]
+            if trail_bsz < 4 or trail_bsz > 65536:
+                return -1
+            return trail_pos + trail_bsz
+
+        def _simulate_n_agents(start: int, n: int) -> int:
+            """Simulate decoding *n* agents from *start*.  Returns final end pos, or -1."""
+            pos = start
+            for _ in range(n):
+                pos = _simulate_one_agent(pos)
+                if pos < 0:
+                    return -1
+            return pos
+
+        # Phase 1: strong check — simulate ALL _num_agents agents from each candidate
+        # position and require the chain ends exactly at the file end.
+        #
+        # Two sub-cases:
+        # (a) PAL is the LAST resource (remaining_resources == 1): agents follow directly.
+        #     The first candidate where N agents end at EOF is the agent start.
+        # (b) PAL is NOT the last resource but all remaining resources are embedded in
+        #     the PAL constraint graph blob (corpus evidence: elainestruggle, doroplay,
+        #     lechuckvoodoomonkeys — all have mNumResources > PAL index yet the PAL blob
+        #     extends all the way to the agent section).  Phase 1 still correctly identifies
+        #     the agent start; the caller is signalled via _pal_skip_out to skip all
+        #     remaining resource loop iterations.
+        _found = False
+        if _num_agents > 0:
+            for _i in range(_scan_start, _scan_end - 7):
+                _chain_end = _simulate_n_agents(_i, _num_agents)
+                if _chain_end == _scan_end:
+                    _skipped = _i - _scan_start
+                    _found = True
+                    # Signal caller to skip remaining resources when PAL consumed them.
+                    if _remaining_resources > 1 and _pal_skip_out is not None:
+                        _pal_skip_out[0] = _remaining_resources - 1
+                    break
+
+        if not _found:
+            # Last resort: skip to EOF.  No structure boundary could be located.
+            _skipped = _scan_end - _scan_start
+
+        if _skipped > 0:
+            reader.skip(_skipped)
+        log.warning(
+            "decode_chore_resource_mtre: PAL mAAStatus skipped %d bytes "
+            "(inner_bsz=0x%08x indicates Procedural Look At constraint graph)",
+            _skipped + 8, _inner_bsz,
+        )
+    elif _inner_bsz >= 4:
         reader.skip(_inner_bsz - 4)
 
     if log.isEnabledFor(logging.INFO):
@@ -614,32 +769,48 @@ def decode_chore_agent_mtre(reader: MetaStreamReader, stream_version: int) -> Ch
     """Decode one ChoreAgent from an MTRE (sv<=3) stream.
 
     MTRE ChoreAgent wire layout (empirically confirmed from binary analysis of
-    adv_act3waves_worldmover_zero.chore and _sk20_move_guybrush_setface.chore):
+    adv_act3waves_worldmover_zero.chore, adv_act3waves_worldmover.chore, and
+    adv_act3_startdialog.chore):
 
     1.  mAgentName   block-wrapped String  (bsz=0 for empty OR bsz=N for named)
-    2.  mResources   block-wrapped DCArray<int>  (bsz=N; count u32 + raw i32s)
-    3.  mAttachment  block (skip_block)    (51 bytes in EP1; variable)
-    4.  block4       block (skip_block)    (28 bytes in EP1; unknown constant tail)
+    2.  mFlags       raw u32               ONLY present when mAgentName is non-empty
+    3.  mResources   block-wrapped DCArray<int>  (bsz=N; count u32 + raw i32s)
+    4.  mAttachment  block (skip_block)    (51 bytes in EP1; variable)
+    5.  block4       block (skip_block)    (28 bytes in EP1; unknown constant tail)
 
-    Byte evidence (medium chore, abs 559):
-      pos+0:  00 00 00 00  → bsz=0  mAgentName=''
+    mFlags is a raw u32 (not block-wrapped) written only for named agents.  Anonymous
+    agents (empty mAgentName) omit mFlags entirely.  This was confirmed by end-of-file
+    cross-checks on three EP1 chores:
+      worldmover_zero.chore  — 1 anonymous agent  → no mFlags → end=654  file=654 OK
+      worldmover.chore       — 5 agents (4 named) → mFlags for named → end=3489 file=3489 OK
+      adv_act3_startdialog   — 3 agents (2 named) → mFlags for named → end=2525 file=2525 OK
+
+    Byte evidence (medium chore, abs 559 — anonymous agent):
+      pos+0:  00 00 00 00  → bsz=0  mAgentName=''  [no mFlags]
       pos+4:  0c 00 00 00  → bsz=12 mResources block (4-bsz + 4-count + 1×4-idx)
       pos+8:  01 00 00 00  → count=1
       pos+12: 00 00 00 00  → idx=0
       pos+16: 33 00 00 00  → bsz=51 mAttachment block
       pos+67: 1c 00 00 00  → bsz=28 trailer block
 
-    Byte evidence (large chore, abs 2384):
-      pos+0:  00 00 00 00  → bsz=0  mAgentName=''
+    Byte evidence (large chore, abs 2384 — anonymous agent):
+      pos+0:  00 00 00 00  → bsz=0  mAgentName=''  [no mFlags]
       pos+4:  20 00 00 00  → bsz=32 mResources block (4-bsz + 4-count + 6×4-idx)
       pos+8:  06 00 00 00  → count=6
       pos+12: 00..05 (6 × i32 indices)
       pos+44: 33 00 00 00  → bsz=51 mAttachment
       pos+95: 1c 00 00 00  → bsz=28 trailer
 
-    mFlags, mAABinding, and mAgentEnabledRule are absent from the MTRE wire in
-    all EP1 chores (confirmed by iOS ChoreAgent::MetaOperation_Serialize at VA
-    0x0020B714 — 5-instruction pure-default stub, no version gates).
+    Byte evidence (worldmover.chore — named agent "Guybrush" at example position):
+      pos+0:  1e 00 00 00  → bsz=30 mAgentName block (4-bsz + 4-len + 22-chars)
+      ...name bytes...
+      pos+30: 00 00 00 00  → mFlags raw u32 = 0
+      pos+34: 0c 00 00 00  → bsz=12 mResources block
+      ...
+
+    mAABinding and mAgentEnabledRule are absent from the MTRE wire in all EP1 chores
+    (confirmed by iOS ChoreAgent::MetaOperation_Serialize at VA 0x0020B714 —
+    5-instruction pure-default stub, no version gates).
     mResources indices reference into chore.resources[] (0-based).
     """
     if log.isEnabledFor(logging.INFO):
@@ -648,9 +819,33 @@ def decode_chore_agent_mtre(reader: MetaStreamReader, stream_version: int) -> Ch
     # 1. mAgentName — block-wrapped String (bsz=0 → '')
     m_agent_name = _mtre_read_string_block(reader)
 
-    # 2. mResources — block-wrapped DCArray<int>
+    # 2. mFlags — raw u32, ONLY present in chore files where the ChoreAgent SVI
+    # includes mFlags in the serialized member set.
+    #
+    # Detection heuristic: peek the next u32.  If it is a valid mResources DCArray
+    # block-size (bsz == 4 OR bsz == 8 OR (bsz >= 8 AND (bsz-8)%4==0 AND bsz<=2048)),
+    # the next field IS mResources (no mFlags present).  Otherwise, it is mFlags and
+    # the u32 after that is the mResources bsz.
+    #
+    # Two observed variants in the EP1 corpus:
+    #   • worldmover.chore (9 classes): named agents have mFlags=100000 (>2048), so the
+    #     peek is NOT a valid bsz → mFlags IS consumed.
+    #   • adv_captainjack.chore (10 classes): named "Guybrush" has res_bsz=28 immediately
+    #     after the name block (28 is valid: (28-8)%4=0) → mFlags is ABSENT.
+    #   • Anonymous agents (name bsz=0): res_bsz follows directly, never mFlags.
+    _peek = reader.peek_uint32()
+    _valid_res_bsz = (
+        _peek == 4
+        or (_peek >= 8 and (_peek - 8) % 4 == 0 and _peek <= 2048)
+    )
+    if _valid_res_bsz:
+        m_flags = 0   # mResources bsz comes next; mFlags absent for this SVI
+    else:
+        m_flags = reader.read_uint32()  # consume mFlags; mResources bsz follows
+
+    # 3. mResources — block-wrapped DCArray<int>
     # Wire: u32 bsz (inclusive), u32 count, count × i32 indices.
-    # No leading placeholder: the first u32 after mAgentName IS the bsz.
+    # The first u32 after mAgentName (or after mFlags when mFlags is present) IS the bsz.
     # Empirically confirmed on EP1 corpus: bsz=12 for count=1, bsz=32 for count=6.
     _res_bsz = reader.read_uint32()
     m_resources: list = []
@@ -664,10 +859,10 @@ def decode_chore_agent_mtre(reader: MetaStreamReader, stream_version: int) -> Ch
     elif _res_bsz >= 4:
         pass  # bsz=4: count=0 implied (no content bytes)
 
-    # 3. mAttachment — skip entire block (bsz=51 in EP1)
+    # 4. mAttachment — skip entire block (bsz=51 in EP1)
     reader.skip_block()
 
-    # 4. block4 — skip 28-byte constant trailing block (purpose unresolved)
+    # 5. block4 — skip 28-byte constant trailing block (purpose unresolved)
     reader.skip_block()
 
     if log.isEnabledFor(logging.INFO):
@@ -712,32 +907,69 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
     if log.isEnabledFor(logging.INFO):
         log.info("decode_chore: entry at pos=%d sv=%d", reader.pos, stream_version)
 
-    # Detect MTRE hint-chore layout: EP1 4-class files (Chore, PropertySet, Flags, Symbol)
-    # omit mFlags/mLength/mNumResources/mNumAgents entirely from the wire.  Files with
-    # more class entries (resources, agents, etc.) include those 4 scalar fields but
-    # write them WITHOUT individual block wrappers (raw u8+f32+i32+i32 sequence).
-    # Synthetic test fixtures use standard blocked framing regardless of class count,
-    # so we gate only on the class-entry count observed in the real MTRE header.
+    # Detect MTRE layout variant based on class-entry count + per-file peek.
+    #
+    # Three variants exist in the EP1 corpus:
+    #
+    # VARIANT A — "hint" (true 4-class hint chores):
+    #   Classes: Chore, PropertySet, Flags, Symbol (exactly 4).
+    #   mFlags/mLength/mNumResources/mNumAgents are ABSENT from the wire.
+    #   After mName block, the next bytes are mEditorProps bsz (a small u32 ≤ 256
+    #   with high 3 bytes == 0, e.g., 0x1C000000 LE = 28).
+    #
+    # VARIANT B — "non-hint" (most EP1 chores, class_count >= 5):
+    #   Classes include ChoreResource, ChoreAgent, etc. (>= 5 entries typical >= 9).
+    #   mFlags/mLength/mNumResources/mNumAgents written as raw unframed scalars
+    #   (u8 + f32 + i32 + i32 = 13 bytes, no block headers), then compact tail.
+    #
+    # VARIANT C — "4-class non-hint" (rare; 2 known EP1 files):
+    #   Classes: exactly 4, but the file contains raw mFlags etc. like Variant B.
+    #   Known files: env_voodooladyinterior_use_bookshelf_e12_668.chore
+    #                layout_voodooladyinterior_voodoolady.chore
+    #   Distinguisher: after mName block, the next byte (mFlags u8) + subsequent 3
+    #   bytes form a float (mLength).  Because mFlags is 0x30 (48) in these files,
+    #   the LE u32 at reader.pos has non-zero byte[0] with non-zero bytes[1..3]
+    #   (the float bytes of mLength).  Contrast with true hint chores where the
+    #   same position holds mEditorProps bsz = small u32 with bytes[1..3] == 0x00.
+    #
+    # Detection logic (applied AFTER mName is read, so reader.pos is at the next field):
+    #   If class_count == 4 AND sv <= 3:
+    #     peek 4 bytes.  If bytes[1], [2], [3] are all 0 → Variant A (hint).
+    #     Otherwise → Variant C (4-class non-hint, treat same as Variant B).
+    #
+    # Synthetic test fixtures always use 1 class entry with standard block framing,
+    # so none of the MTRE branches activate for them (class_count == 1, sv is 0).
     _mtre_class_count = len(reader.header.classes) if reader.header else 0
-    # MTRE EP1 hint chores have exactly 4 class entries (Chore, PropertySet, Flags, Symbol).
-    # These files omit mFlags/mLength/mNumResources/mNumAgents from the wire entirely and
-    # encode fields 7-12 in a non-standard non-block-prefixed tail format.
-    # Synthetic test fixtures always use 1 class entry with standard block framing, so
-    # the == 4 guard keeps the standard decode path for tests while activating the
-    # hint-chore bypass for real EP1 files.
-    _mtre_hint_layout = (stream_version <= 3 and _mtre_class_count == 4)
-    # MTRE EP1 non-hint chores have >=9 class entries (include ChoreResource, ChoreAgent, etc.).
-    # These files write mFlags/mLength/mNumResources/mNumAgents as raw unframed bytes
-    # (u8 + f32 + i32 + i32 = 13 bytes total, no block headers), then a compact tail for
-    # fields 7-12, followed by MTRE-specific ChoreResource and ChoreAgent post-loops.
-    # The compact tail and post-loops are decoded by decode_chore_resource_mtre and
-    # decode_chore_agent_mtre (empirically derived from EP1 binary analysis).
-    _mtre_nonhint_layout = (stream_version <= 3 and _mtre_class_count > 4)
 
     # 1. mName — Chore.h:422 String
     reader.begin_block()
     m_name = decode_string(reader, stream_version)
     reader.end_block()
+
+    # Determine variant now that mName has been consumed and reader.pos points at
+    # the next field (either mEditorProps bsz for hint, or raw mFlags u8 for non-hint).
+    if stream_version <= 3 and _mtre_class_count == 4:
+        # Peek the next 4 bytes to distinguish Variant A vs Variant C.
+        _peek = reader._data[reader.pos:reader.pos + 4]
+        if len(_peek) == 4 and _peek[1] == 0 and _peek[2] == 0 and _peek[3] == 0:
+            _mtre_hint_layout = True
+            _mtre_nonhint_layout = False
+            log.debug(
+                "decode_chore: MTRE 4-class HINT layout (class_count=4) — "
+                "peek=%s → mEditorProps bsz follows directly",
+                _peek.hex() if hasattr(_peek, 'hex') else list(_peek),
+            )
+        else:
+            _mtre_hint_layout = False
+            _mtre_nonhint_layout = True
+            log.debug(
+                "decode_chore: MTRE 4-class NON-HINT layout (class_count=4) — "
+                "peek=%s → raw mFlags/mLength/mNumRes/mNumAg follow",
+                _peek.hex() if hasattr(_peek, 'hex') else list(_peek),
+            )
+    else:
+        _mtre_hint_layout = False
+        _mtre_nonhint_layout = (stream_version <= 3 and _mtre_class_count > 4)
 
     if _mtre_hint_layout:
         # MTRE hint-chore: mFlags/mLength/mNumResources/mNumAgents absent from wire.
@@ -854,10 +1086,9 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
         #
         # We reconstruct mChoreSceneFile by reading the 3 strlen continuation bytes
         # and combining with the known low byte (0x0d = raw data[pos-1]).
-        import struct as _struct
         _strlen_lo = reader._data[reader.pos - 1]           # last byte of EP block = 0x0d
         _strlen_hi_bytes = reader.read_bytes(3)             # 3 high bytes of strlen u32
-        _csf_strlen = _struct.unpack_from(
+        _csf_strlen = struct.unpack_from(
             '<I', bytes([_strlen_lo]) + _strlen_hi_bytes
         )[0]                                                # = 13 for EP1 hint chores
         _csf_bytes = reader.read_bytes(_csf_strlen)
@@ -1006,9 +1237,32 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
             "decode_chore: starting ChoreResource post-loop: %d resources (mtre=%s)",
             _post_loop_resources, _use_mtre_decoders,
         )
+    # _pal_skip_out: mutable [int] cell.  When a PAL resource's constraint-graph
+    # blob extends to the agent section (consuming all remaining resources), Phase 1
+    # sets _pal_skip_out[0] = number of additional resource slots to skip.  Those
+    # slots are added as empty ChoreResources so len(chore.resources) remains equal
+    # to chore.mNumResources, satisfying the validate_chores contract.
+    _pal_skip_out: "list[int]" = [0]
     for i in range(_post_loop_resources):
+        if _pal_skip_out[0] > 0:
+            # Remaining resource slots were consumed by the previous PAL blob.
+            _pal_skip_out[0] -= 1
+            chore.resources.append(ChoreResource(
+                mVersion=0, mResName=0, mResLength=0.0, mPriority=0, mFlags=0,
+                mResourceGroup="", mhObject=None, mControlAnimation=None,
+                mBlocks=[], mbNoPose=False, mbEmbedded=False, mbEnabled=False,
+                mbIsAgentResource=False, mbViewGraphs=False, mbViewEmptyGraphs=False,
+                mbViewProperties=False, mbViewResourceGroups=False,
+                mResourceProperties=None, mResourceGroupInclude={}, mAAStatus=None,
+            ))
+            continue
         if _use_mtre_decoders:
-            resource = decode_chore_resource_mtre(reader, stream_version)
+            resource = decode_chore_resource_mtre(
+                reader, stream_version,
+                _num_agents=_post_loop_agents,
+                _remaining_resources=_post_loop_resources - i,
+                _pal_skip_out=_pal_skip_out,
+            )
         else:
             resource = decode_chore_resource(reader, stream_version)
         chore.resources.append(resource)
@@ -1199,7 +1453,6 @@ def assert_field_byte_range(
     AssertionError
         If ``struct.pack(fmt, decoded_value)`` does not equal the raw file slice.
     """
-    import struct
     size = struct.calcsize(fmt)
     with open(path, "rb") as f:
         f.seek(offset)
