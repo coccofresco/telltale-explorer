@@ -16,20 +16,33 @@ Decodes the MetaStream v3 (MTRE) PhonemeTable container:
     }
 
 Verified on all 74 ep1 ptable files (888 entries, 100% CRC-matched keys).
+
+Rewired (Phase 8 / INFRA-05) to run on top of
+telltale.metastream.MetaStreamReader + the Phase 4 meta_ptable registered
+decoder chain.  Public API (signature, dataclass types, field names) is
+unchanged from the v1.1 implementation.
 """
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 from typing import List
 
 from telltale import metastream
+from telltale.metastream import MetaStreamReader
+from telltale.meta_intrinsics import decode_symbol
+import telltale.meta_ptable as _meta_ptable  # noqa: F401 — force registration
+from telltale.meta_ptable import decode_phoneme_entry
 
 
-def _u32(d: bytes, p: int) -> int: return struct.unpack_from("<I", d, p)[0]
-def _u64(d: bytes, p: int) -> int: return struct.unpack_from("<Q", d, p)[0]
-def _f32(d: bytes, p: int) -> float: return struct.unpack_from("<f", d, p)[0]
+# Map header.version strings to the effective stream version integer
+# used for container-level decoder branching (MTRE Symbol-key debug-strlen).
+_VERSION_TO_SV: dict[str, int] = {
+    "MBIN": 2,
+    "MTRE": 3,
+    "MSV5": 5,
+    "MSV6": 6,
+}
 
 
 @dataclass
@@ -47,69 +60,66 @@ class PhonemeTable:
 
 
 def _read_handle_string(d: bytes, p: int) -> tuple[str, int]:
-    """Handle<T> in MTRE (stream version < 5) serializes as a String.
+    """Compatibility shim retained for test_meta_handle.py parity tests.
 
-    Returns the decoded string and the position of the 4-byte strlen field's end.
+    Reads a u32-length-prefixed latin1 string from raw bytes *d* at offset
+    *p*.  Returns (decoded_str, end_position).  This function is never called
+    from parse_ptable itself — it is preserved solely for tests that compare
+    their output against this reference decoder.
     """
-    slen = _u32(d, p); p += 4
-    s = d[p:p+slen].decode("latin1")
+    slen = int.from_bytes(d[p:p + 4], "little")
+    p += 4
+    s = d[p:p + slen].decode("latin1")
     return s, p + slen
 
 
 def parse_ptable(path: str) -> PhonemeTable:
-    """Parse a .ptable file and return (name, list of PhonemeEntry)."""
+    """Parse a .ptable file and return (name, list of PhonemeEntry).
+
+    Reads all file bytes exclusively via telltale.metastream.MetaStreamReader
+    primitives (read_uint32, read_uint64, read_bytes, read_float32) and
+    block-stack operations (begin_block / end_block).  The inner PhonemeEntry
+    members are decoded by telltale.meta_ptable.decode_phoneme_entry which is
+    already validated on all 74 EP1 ptables by Phase 4.
+    """
     with open(path, "rb") as f:
-        d = f.read()
-    h = metastream.parse_header(path)
-    p = h.data_offset
+        data = f.read()
 
-    # mName block
-    name_blk_sz = _u32(d, p); name_end = p + name_blk_sz; p += 4
-    name, p = _read_handle_string(d, p)
-    p = name_end
+    header = metastream.parse_header(data)
+    sv = _VERSION_TO_SV.get(header.version, 3)
+    reader = MetaStreamReader(data, header=header, debug=False)
 
-    # mAnimations (Map) block
-    map_blk_start = p
-    map_blk_sz = _u32(d, p); p += 4
-    map_end = map_blk_start + map_blk_sz
+    # mName block: [u32 block_size][u32 slen][slen bytes latin1]
+    reader.begin_block()
+    slen = reader.read_uint32()
+    name = reader.read_bytes(slen).decode("latin1")
+    reader.end_block()
 
-    num = _u32(d, p); p += 4
+    # mAnimations block: [u32 block_size][u32 count][count * (Symbol, PhonemeEntry)]
+    # Symbol key in MTRE: u64 CRC + u32 empty-debug-string length
+    reader.begin_block()
+    num = reader.read_uint32()
     entries: List[PhonemeEntry] = []
     for _ in range(num):
-        # Symbol key: u64 CRC + u32 empty-debug-string length (MTRE)
-        sym = _u64(d, p); p += 8
-        dbg_len = _u32(d, p); p += 4
-        if dbg_len != 0:
-            raise ValueError(f"unexpected debug strlen {dbg_len} in Symbol at {p-4:#x}")
-
-        # PhonemeEntry (members walked; no outer block)
-        #   mAnimation (AnimOrChore) -- blocked
-        mAnim_start = p
-        mAnim_sz = _u32(d, p); p += 4
-        mAnim_end = mAnim_start + mAnim_sz
-
-        #     mhAnim (Handle<Animation>) -- blocked, String in MTRE
-        mhA_start = p
-        mhA_sz = _u32(d, p); p += 4
-        anim_name, p = _read_handle_string(d, p)
-        p = mhA_start + mhA_sz
-
-        #     mhChore (Handle<Chore>) -- blocked, String in MTRE (empty for ep1)
-        mhC_start = p
-        mhC_sz = _u32(d, p); p += 4
-        chore_name, p = _read_handle_string(d, p)
-        p = mhC_start + mhC_sz
-
-        if p != mAnim_end:
-            raise ValueError(f"AnimOrChore block misalignment: {p:#x} != {mAnim_end:#x}")
-
-        #   trailing float (mContributionScalar or mTimeScalar; always 0.0 in TMI)
-        extra = _f32(d, p); p += 4
-
-        entries.append(PhonemeEntry(sym, anim_name, chore_name, extra))
-
-    if p != map_end:
-        raise ValueError(f"Map block misalignment: {p:#x} != {map_end:#x}")
+        sym = decode_symbol(reader, sv, include_mtre_debug_strlen=(sv <= 4))
+        pe = decode_phoneme_entry(reader, sv)
+        anim_name = (
+            pe.mAnimation.mhAnim.object_name_str
+            if pe.mAnimation and pe.mAnimation.mhAnim
+            else ""
+        )
+        chore_name = (
+            pe.mAnimation.mhChore.object_name_str
+            if pe.mAnimation and pe.mAnimation.mhChore
+            else ""
+        )
+        entries.append(PhonemeEntry(
+            phoneme_id=sym,
+            anim_name=anim_name or "",
+            chore_name=chore_name or "",
+            extra=pe.mExtra,
+        ))
+    reader.end_block()
 
     return PhonemeTable(name=name, entries=entries)
 
