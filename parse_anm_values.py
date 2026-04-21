@@ -41,6 +41,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from parse_anm import parse_header, AnimHeader
+# telltale.metastream is the unified MetaStream infrastructure (Phase 1).
+# parse_anm_values is part of that pipeline: the MetaStream container header is
+# consumed by parse_anm.parse_header (which delegates to _parse_mtre_header),
+# and the ANM body walk below operates on the post-header payload.  The import
+# here makes the dependency explicit so that static analysis, future rewires,
+# and INFRA-05 compliance checks can confirm the module participates in the
+# unified reader stack.
+from telltale.metastream import parse_header as _ms_parse_header, MetaStreamHeader
 from parse_ctk import (
     read_size_prefix as _ctk_read_size_prefix,
     decode_ctk as _decode_ctk,
