@@ -484,6 +484,14 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
     # the == 4 guard keeps the standard decode path for tests while activating the
     # hint-chore bypass for real EP1 files.
     _mtre_hint_layout = (stream_version <= 3 and _mtre_class_count == 4)
+    # MTRE EP1 non-hint chores have >=9 class entries (include ChoreResource, ChoreAgent, etc.).
+    # These files write mFlags/mLength/mNumResources/mNumAgents as raw unframed bytes
+    # (u8 + f32 + i32 + i32 = 13 bytes total, no block headers).  Fields 7-12 and the
+    # ChoreResource/ChoreAgent post-loops use a non-standard MTRE wire format that has
+    # not been reversed (Phase 8 scope).  We decode the raw scalars to capture
+    # mNumResources/mNumAgents accurately, then skip to EOF.  The custom post-loops do NOT
+    # run for MTRE non-hint chores — they would require full MTRE-specific decode.
+    _mtre_nonhint_layout = (stream_version <= 3 and _mtre_class_count > 4)
 
     # 1. mName — Chore.h:422 String
     reader.begin_block()
@@ -502,6 +510,25 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
         m_length = 0.0
         m_num_resources = 0
         m_num_agents = 0
+    elif _mtre_nonhint_layout:
+        # MTRE non-hint chore: raw unframed scalars (no begin_block/end_block wrappers).
+        # Binary analysis of adv_act3waves_worldmover_zero.chore (654 B, 9 classes) and
+        # _sk20_move_guybrush_setface.chore (2499 B, 11 classes) confirmed the layout:
+        #   pos+0: mFlags        u8   (1 byte)
+        #   pos+1: mLength       f32  (4 bytes, LE)
+        #   pos+5: mNumResources i32  (4 bytes, LE) — raw file offset used by byte-range test
+        #   pos+9: mNumAgents    i32  (4 bytes, LE) — raw file offset used by byte-range test
+        # The position of these fields depends only on the mName block size, which varies
+        # per chore.  Offsets are pinned in tests/test_chore_corpus_phase7.py BYTE_RANGE_CASES.
+        log.debug(
+            "decode_chore: MTRE non-hint layout (class_count=%d) — "
+            "reading raw scalars mFlags/mLength/mNumResources/mNumAgents",
+            _mtre_class_count,
+        )
+        m_flags = reader.read_uint8()
+        m_length = reader.read_float32()
+        m_num_resources = reader.read_int32()
+        m_num_agents = reader.read_int32()
     else:
         # 2. mFlags — Chore.h:423 Flags (u32)
         reader.begin_block()
@@ -525,25 +552,58 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
 
     # 6. mEditorProps — Chore.h:427 PropertySet
     # Reuses Phase 5 decode_propertyset (05-02-SUMMARY.md pattern).
-    reader.begin_block()
-    m_editor_props = decode_propertyset(reader, stream_version)
-    reader.end_block()
+    #
+    # MTRE non-hint chore complication: decode_propertyset FORMAT B detects inline layout
+    # (peek_uint32() != 8) and reads mPropVersion=1 + mPropertyFlags + skip(1) padding byte.
+    # For MTRE non-hint chores (mPropVersion=1), there is NO padding byte — the skip(1) moves
+    # past the first byte of the custom section's block_size u32, corrupting all subsequent
+    # reads and causing EOFError deep inside decode_propertyset.
+    # Since meta_propertyset.py is frozen (Phase 5 contract), we recover via try/except:
+    # capture the outer block boundaries before calling decode_propertyset, drain any orphaned
+    # inner block stack frames on failure, then seek to end_abs so the outer end_block()
+    # closes correctly.
+    if _mtre_nonhint_layout:
+        # Capture block stack depth before begin_block to detect orphaned inner frames.
+        _stack_depth_before = len(reader._block_stack)
+        _, _editor_props_end = reader.begin_block()
+        try:
+            m_editor_props = decode_propertyset(reader, stream_version)
+        except Exception:
+            log.debug(
+                "decode_chore: MTRE non-hint mEditorProps decode failed "
+                "(FORMAT B skip(1) mismatch for mPropVersion=1); "
+                "draining block stack and seeking to block end at %d",
+                _editor_props_end,
+            )
+            # Drain all frames that decode_propertyset pushed but never popped.
+            while len(reader._block_stack) > _stack_depth_before:
+                reader._block_stack.pop()
+            # Seek directly to end of the outer mEditorProps block.
+            reader.seek(_editor_props_end)
+            from telltale.meta_propertyset import PropertySet
+            m_editor_props = PropertySet(mPropVersion=0, mPropertyFlags=0)
+        else:
+            reader.end_block()
+    else:
+        reader.begin_block()
+        m_editor_props = decode_propertyset(reader, stream_version)
+        reader.end_block()
 
-    if _mtre_hint_layout:
-        # MTRE hint-chore: fields 7-12 use a non-standard non-block-prefixed encoding.
-        # Binary analysis (analyze_chore.py / analyze2.py) confirmed the 38-byte tail:
-        #   [3 null bytes][scene_name][0x30][21 fixed bytes ending in 0x30]
-        # The encoding does not begin with a valid LE u32 block_size (would read as
-        # 0x64000000=1677721600 for 'default.scene'), so standard begin_block calls
-        # would corrupt the reader.  Skip all remaining bytes to EOF; mNumResources=0
-        # so no post-loop iterations will run.  Full MTRE tail decode is deferred to
-        # Plan 07-03 (corpus validation phase).
+    if _mtre_hint_layout or _mtre_nonhint_layout:
+        # MTRE (both hint and non-hint): fields 7-12 use non-standard non-block-prefixed
+        # encoding that has not been reversed.  Skip all remaining bytes to EOF.
+        # For hint chores: mNumResources=0 so post-loops are skipped.
+        # For non-hint chores: the ChoreResource/ChoreAgent post-loops use an unknown MTRE
+        # wire format incompatible with the iOS/MSV5 block-wrapped decoders — post-loops
+        # are intentionally skipped here; mNumResources / mNumAgents retain their decoded
+        # values for byte-range validation.  Phase 8 owns full MTRE resource/agent decode.
         remaining = len(reader._data) - reader.pos
         if remaining > 0:
             reader.skip(remaining)
             log.debug(
-                "decode_chore: MTRE hint-chore — skipped %d tail bytes (fields 7-12)",
-                remaining,
+                "decode_chore: MTRE layout (class_count=%d) — "
+                "skipped %d tail bytes (fields 7-12 + post-loops use non-standard encoding)",
+                _mtre_class_count, remaining,
             )
         m_chore_scene_file = ""
         m_render_delay = 0
@@ -551,6 +611,19 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
         m_dependencies = DependencyLoader1()
         m_tool_props = ToolProps(mbHasProps=False)
         m_walk_paths = {}
+        # For non-hint MTRE, resources/agents cannot be decoded (Phase 8 scope).
+        # We preserve m_num_resources/m_num_agents for storage in the Chore dataclass
+        # (so byte-range tests can verify them via chore.mNumResources).  The post-loops
+        # must NOT run with the iOS/MSV5 block-wrapped decoders — use separate counters.
+        if _mtre_nonhint_layout:
+            log.debug(
+                "decode_chore: MTRE non-hint — mNumResources=%d mNumAgents=%d "
+                "stored in Chore but post-loops suppressed "
+                "(MTRE resource/agent format unresolved; Phase 8)",
+                m_num_resources, m_num_agents,
+            )
+        _post_loop_resources = 0  # always 0 for MTRE (hint or non-hint)
+        _post_loop_agents = 0
     else:
         # 7. mChoreSceneFile — Chore.h:428 String
         reader.begin_block()
@@ -590,8 +663,14 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
         reader.end_block()
         if m_walk_paths is None:
             m_walk_paths = {}
+        # Standard (MSV5/MSV6 / synthetic) path: run post-loops using the declared counts.
+        _post_loop_resources = m_num_resources
+        _post_loop_agents = m_num_agents
 
     # Build Chore with all 12 top-level fields.
+    # Note: for MTRE non-hint chores, mNumResources/mNumAgents hold the raw decoded values
+    # from the unframed scalar bytes (used by byte-range cross-check tests), while
+    # _post_loop_resources/_post_loop_agents are 0 to suppress the incompatible post-loops.
     chore = Chore(
         mName=m_name,
         mFlags=m_flags,
@@ -609,22 +688,24 @@ def decode_chore(reader: MetaStreamReader, stream_version: int) -> Chore:
 
     # Custom post-loop (Chore.h:601-647):
     # mNumResources × PerformMetaSerialize<ChoreResource> (iOS VA 0x002089D0)
+    # For MTRE files: _post_loop_resources == 0 (post-loops suppressed; see above).
     if log.isEnabledFor(logging.INFO):
         log.info(
             "decode_chore: starting ChoreResource post-loop: %d resources",
-            m_num_resources,
+            _post_loop_resources,
         )
-    for i in range(m_num_resources):
+    for i in range(_post_loop_resources):
         resource = decode_chore_resource(reader, stream_version)
         chore.resources.append(resource)
 
     # mNumAgents × PerformMetaSerialize<ChoreAgent> (iOS VA 0x00208980)
+    # For MTRE files: _post_loop_agents == 0 (post-loops suppressed; see above).
     if log.isEnabledFor(logging.INFO):
         log.info(
             "decode_chore: starting ChoreAgent post-loop: %d agents",
-            m_num_agents,
+            _post_loop_agents,
         )
-    for i in range(m_num_agents):
+    for i in range(_post_loop_agents):
         agent = decode_chore_agent(reader, stream_version)
         chore.agents.append(agent)
 
@@ -719,3 +800,97 @@ def _register_chore_decoders() -> None:
 
 
 _register_chore_decoders()
+
+
+# ---------------------------------------------------------------------------
+# Corpus validation harness (Phase 7 analog of Phase 5/6 harnesses)
+# ---------------------------------------------------------------------------
+
+def validate_chores(paths: "list[str]") -> "ChoreValidationReport":
+    """Phase 7 corpus harness — mirror of validate_chore_leaves_corpus (Phase 6).
+
+    For each path, attempts ``parse_chore(path)``.  Clean if no exception is raised
+    AND ``len(chore.resources) == chore.mNumResources`` AND
+    ``len(chore.agents) == chore.mNumAgents``.  Misaligned if an exception is raised
+    or either count disagrees with the decoded header value.
+
+    Pattern reference: ``telltale.meta_chore_leaves.validate_chore_leaves_corpus``
+    (Phase 6 Plan 06-03).
+
+    Note: MTRE non-hint chores (EP1 files with class_count > 4) decode mNumResources
+    and mNumAgents from the wire but suppress the ChoreResource/ChoreAgent post-loops
+    (incompatible MTRE format; Phase 8 scope).  For these files the count check will
+    produce a misalignment entry.  The decoded mNumResources/mNumAgents values are
+    still correct for byte-range validation via ``assert_field_byte_range``.
+    """
+    # Lazy import mirrors STATE 06-03 decision (avoid circular imports at module load).
+    from telltale.validation import ChoreValidationReport
+    total = len(paths)
+    clean = 0
+    misalignments: "list[tuple[str, str]]" = []
+    for path in paths:
+        try:
+            chore = parse_chore(path)
+            if len(chore.resources) != chore.mNumResources:
+                misalignments.append((
+                    path,
+                    f"resources count {len(chore.resources)} != mNumResources {chore.mNumResources}",
+                ))
+                continue
+            if len(chore.agents) != chore.mNumAgents:
+                misalignments.append((
+                    path,
+                    f"agents count {len(chore.agents)} != mNumAgents {chore.mNumAgents}",
+                ))
+                continue
+            clean += 1
+        except Exception as exc:
+            misalignments.append((path, f"{type(exc).__name__}: {exc}"))
+    return ChoreValidationReport(files_total=total, files_clean=clean, misalignments=misalignments)
+
+
+# ---------------------------------------------------------------------------
+# Byte-range cross-check helper (ROADMAP Phase 7 success criterion 5)
+# ---------------------------------------------------------------------------
+
+def assert_field_byte_range(
+    path: "str | Path",
+    offset: int,
+    decoded_value: "int | float",
+    fmt: str,
+) -> None:
+    """Byte-range cross-check helper (ROADMAP Phase 7 success criterion 5).
+
+    Re-pack ``decoded_value`` via ``struct.pack(fmt, decoded_value)`` and compare
+    to the raw file bytes at ``[offset : offset + struct.calcsize(fmt)]``.
+    Raises ``AssertionError`` on mismatch.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the original ``.chore`` file.
+    offset : int
+        Absolute byte offset within the file where the encoded field starts.
+    decoded_value : int or float
+        The value produced by the decoder (e.g. ``chore.mNumResources``).
+    fmt : str
+        ``struct`` format string: ``'<I'`` (u32 LE), ``'<i'`` (i32 LE),
+        ``'<Q'`` (u64 LE), ``'<f'`` (f32 LE), etc.
+
+    Raises
+    ------
+    AssertionError
+        If ``struct.pack(fmt, decoded_value)`` does not equal the raw file slice.
+    """
+    import struct
+    size = struct.calcsize(fmt)
+    with open(path, "rb") as f:
+        f.seek(offset)
+        expected = f.read(size)
+    actual = struct.pack(fmt, decoded_value)
+    if expected != actual:
+        raise AssertionError(
+            f"byte-range mismatch at {path}:{offset} "
+            f"fmt={fmt} decoded={decoded_value!r} "
+            f"expected_bytes={expected.hex()} actual_bytes={actual.hex()}"
+        )
