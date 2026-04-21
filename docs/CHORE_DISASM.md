@@ -361,3 +361,623 @@ is followed exactly for the default meta walk.
   0x00205B70: pop        {r8, sl, fp}
   0x00205B74: pop        {r4, r5, r6, r7, pc}
 ```
+
+## ChoreResource MTRE Wire Format
+
+Resolved via `PerformMetaSerialize<ChoreResource>` (VA 0x002089D0), which calls `PerformMetaOperation` with opcode 0x14 (Serialize) into
+`ChoreResource::MetaOperation_Serialize` (VA 0x002113E0).
+
+The concrete serializer calls `Meta::MetaOperation_SerializeAsync` (VA 0x001E99CC)
+which walks `ChoreResource::InternalGetMetaClassDescription` (VA 0x002082B8)
+to iterate the 21 registered fields in registration order.
+
+**No `BeginBlock`/`EndBlock` calls are present** in
+`ChoreResource::MetaOperation_Serialize` — all fields are **inline** (MTRE framing).
+The only version-gated branch is at VA 0x0021144C (`cmp r3, #1`) which
+activates the `mVersion = 1` write-path for MSV-format streams.  MTRE streams
+(sv <= 3) pass through this branch without setting `mVersion = 1`.
+
+An **embedded-object branch** at VA 0x00211494 handles `mhObject` when
+`mbEmbedded == true` (ldrb r3, [r2, #0x6d]): it reads a `Symbol` name for
+the type, instantiates via `MetaClassDescription::New`, serializes the nested
+object via `PerformMetaOperation(0x14)`, and stores it via `HandleObjectInfo`.
+When `mbEmbedded == false` the handle path is skipped.
+
+### ChoreResource field walk order (MTRE inline)
+
+Registration extracted from `ChoreResource::InternalGetMetaClassDescription`
+(VA 0x002082B8).  All fields are serialized inline
+by `Meta::MetaOperation_SerializeAsync`; no per-field block headers.
+
+| Order | Field | Struct offset | Chore.h line | Framing | Notes |
+|-------|-------|---------------|--------------|---------|-------|
+| 1 | `mpChore` | 0x00 | Chore.h:256 | inline | Chore back-pointer; not serialized in standard meta walk |
+| 2 | `mVersion` | 0x04 | Chore.h:269 | inline | Version field; cmp r3, #1 at VA 0x0021144C gates the write path |
+| 3 | `mResName` | 0x08 | Chore.h:271 | inline | Symbol — type hash + CRC64 pair |
+| 4 | `mResLength` | 0x0C | Chore.h:272 | inline | float |
+| 5 | `mPriority` | 0x10 | Chore.h:273 | inline | long |
+| 6 | `mFlags` | 0x14 | Chore.h:274 | inline | Flags |
+| 7 | `mResourceGroup` | 0x18 | Chore.h:275 | inline | String |
+| 8 | `mhObject` | 0x1C | Chore.h:276 | inline | HandleBase; embedded-object branch at 0x00211494 |
+| 9 | `mControlAnimation` | 0x20 | Chore.h:280 | inline | Animation; NOT decoded in MTRE path (skip block) |
+| 10 | `mBlocks` | 0x5C | Chore.h:281 | inline | DCArray<Block> |
+| 11 | `mbNoPose` | 0x6C | Chore.h:282 | inline | bool |
+| 12 | `mbEmbedded` | 0x6D | Chore.h:283 | inline | bool |
+| 13 | `mbEnabled` | 0x6E | Chore.h:284 | inline | bool |
+| 14 | `mbIsAgentResource` | 0x6F | Chore.h:285 | inline | bool |
+| 15 | `mbViewGraphs` | 0x70 | Chore.h:286 | inline | bool |
+| 16 | `mbViewEmptyGraphs` | 0x71 | Chore.h:287 | inline | bool |
+| 17 | `mbViewProperties` | 0x72 | Chore.h:288 | inline | bool |
+| 18 | `mbViewResourceGroups` | 0x73 | Chore.h:289 | inline | bool |
+| 19 | `mResourceProperties` | 0x7C | Chore.h:290 | inline | PropertySet |
+| 20 | `mResourceGroupInclude` | 0xC0 | Chore.h:291 | inline | Map<Symbol,float,Symbol::CompareCRC> |
+| 21 | `mAAStatus` | 0x78 | Chore.h:292 | inline | AutoActStatus |
+
+### ChoreResource::MetaOperation_Serialize — observable BL calls
+
+| BL VA | Target VA | Resolved name |
+|-------|-----------|---------------|
+| 0x00211434 | 0x0058F9A4 | <0x0058F9A4> |
+| 0x00211470 | 0x001E99CC | Meta::MetaOperation_SerializeAsync (default member walk) |
+| 0x002114A0 | 0x0001B560 | __ZNK10HandleBase22GetHandleObjectPointerEv |
+| 0x002114C4 | 0x00202344 | __ZNK10HandleBase29GetHandleMetaClassDescriptionEv |
+| 0x002114D4 | 0x001F02C0 | __ZNK20MetaClassDescription20CastToConcreteObjectERPvRPKS_ |
+| 0x002114DC | 0x0000A2B0 | __ZN6SymbolC1Ev |
+| 0x002114E8 | 0x001F0BD4 | __ZNK20MetaClassDescription20GetDescriptionSymbolER6Symbol |
+| 0x002114F4 | 0x000B660C | __Z20PerformMetaSerializeI6SymbolEbP10MetaStreamPT_ |
+| 0x002114FC | 0x0000A2B0 | __ZN6SymbolC1Ev |
+| 0x00211504 | 0x00202344 | __ZNK10HandleBase29GetHandleMetaClassDescriptionEv |
+| 0x0021150C | 0x001F0BD4 | __ZNK20MetaClassDescription20GetDescriptionSymbolER6Symbol |
+| 0x00211518 | 0x000B660C | __Z20PerformMetaSerializeI6SymbolEbP10MetaStreamPT_ |
+| 0x00211540 | 0x00005358 | PerformMetaOperation(opcode=0x14=Serialize) |
+| 0x00211590 | 0x001EC380 | __ZN10MetaStream16serialize_StringER6String |
+| 0x0021159C | 0x0000A2F0 | __ZN6SymbolC1ERK6String |
+| 0x002115A8 | 0x001F0378 | __ZN20MetaClassDescription24FindMetaClassDescriptionEy |
+| 0x002115B4 | 0x00003A34 | __ZNSbIcSt11char_traitsIcE15StringAllocatorIcEED2Ev |
+| 0x002115C8 | 0x0000A2B0 | __ZN6SymbolC1Ev |
+| 0x002115D4 | 0x000B660C | __Z20PerformMetaSerializeI6SymbolEbP10MetaStreamPT_ |
+| 0x002115E0 | 0x001F0378 | __ZN20MetaClassDescription24FindMetaClassDescriptionEy |
+| 0x00211618 | 0x001EC380 | __ZN10MetaStream16serialize_StringER6String |
+| 0x00211624 | 0x0000A2F0 | __ZN6SymbolC1ERK6String |
+| 0x00211630 | 0x001F0378 | __ZN20MetaClassDescription24FindMetaClassDescriptionEy |
+| 0x0021163C | 0x00003A34 | __ZNSbIcSt11char_traitsIcE15StringAllocatorIcEED2Ev |
+| 0x00211650 | 0x0000A2B0 | __ZN6SymbolC1Ev |
+| 0x0021165C | 0x000B660C | __Z20PerformMetaSerializeI6SymbolEbP10MetaStreamPT_ |
+| 0x00211668 | 0x001F0378 | __ZN20MetaClassDescription24FindMetaClassDescriptionEy |
+| 0x0021167C | 0x001F02A0 | __ZNK20MetaClassDescription3NewEv |
+| 0x002116A4 | 0x00005358 | PerformMetaOperation(opcode=0x14=Serialize) |
+| 0x002116B4 | 0x001F02E0 | __ZNK20MetaClassDescription10CastToBaseEPKvPKS_ |
+| 0x002116CC | 0x0001C798 | __ZN16HandleObjectInfo5AllocERK6StringPK20MetaClassDescriptionPv |
+| 0x002116E4 | 0x002023C0 | __ZN10HandleBaseaSE3PtrI16HandleObjectInfoE |
+| 0x00211718 | 0x0001B60C | __Z17PtrModifyRefCountP16HandleObjectInfoi |
+| 0x00211738 | 0x0000530C | __ZN3PtrI16HandleObjectInfoE6AssignEPKS0_ |
+| 0x0021174C | 0x0001B830 | __ZN16HandleObjectInfo19LockAsNotUnloadableEb |
+| 0x00211770 | 0x0001B60C | __Z17PtrModifyRefCountP16HandleObjectInfoi |
+| 0x00211794 | 0x0001B60C | __Z17PtrModifyRefCountP16HandleObjectInfoi |
+| 0x002117B4 | 0x0000530C | __ZN3PtrI16HandleObjectInfoE6AssignEPKS0_ |
+| 0x002117E0 | 0x0001B60C | __Z17PtrModifyRefCountP16HandleObjectInfoi |
+| 0x00211828 | 0x0000530C | __ZN3PtrI16HandleObjectInfoE6AssignEPKS0_ |
+| 0x00211850 | 0x0001B60C | __Z17PtrModifyRefCountP16HandleObjectInfoi |
+| 0x00211880 | 0x00410AD4 | __ZNK6String9ExtentionEv |
+| 0x00211890 | 0x001F0524 | __ZN20MetaClassDescription35FindMetaClassDescriptionByExtentionEPKc |
+| 0x002118B8 | 0x00204B44 | __ZN11ObjCacheMgr14RetrieveObjectERK6StringPK20MetaClassDescription |
+| 0x002118CC | 0x002023C0 | __ZN10HandleBaseaSE3PtrI16HandleObjectInfoE |
+| 0x00211928 | 0x0001B60C | __Z17PtrModifyRefCountP16HandleObjectInfoi |
+| 0x00211950 | 0x0001B60C | __Z17PtrModifyRefCountP16HandleObjectInfoi |
+| 0x00211960 | 0x001EBB60 | __ZN10MetaStream12SetWritebackEv |
+| 0x0021196C | 0x00003A34 | __ZNSbIcSt11char_traitsIcE15StringAllocatorIcEED2Ev |
+| 0x0021197C | 0x0058F9A8 | <0x0058F9A8> |
+| 0x00211984 | 0x00003A34 | __ZNSbIcSt11char_traitsIcE15StringAllocatorIcEED2Ev |
+| 0x002119A4 | 0x0001B5B8 | __ZN10HandleBase5ClearEv |
+| 0x002119AC | 0x0058F9AC | <0x0058F9AC> |
+
+### PerformMetaSerialize\<ChoreResource\> stub disassembly
+
+```
+  0x002089D0: push       {r4, r5, r7, lr}
+  0x002089D4: add        r7, sp, #8
+  0x002089D8: sub        sp, sp, #8
+  0x002089DC: mov        r5, r1
+  0x002089E0: mov        r4, r0
+  0x002089E4: bl         #0x20877c  ; __ZN26MetaClassDescription_TypedI13ChoreResourceE23GetMetaClassDescriptionEv
+  0x002089E8: ldr        r3, [pc, #0x2c]
+  0x002089EC: mov        r2, #0
+  0x002089F0: str        r4, [sp, #4]
+  0x002089F4: ldr        r3, [pc, r3]
+  0x002089F8: str        r3, [sp]
+  0x002089FC: mov        r3, #0x14
+  0x00208A00: mov        r1, r0
+  0x00208A04: mov        r0, r5
+  0x00208A08: bl         #0x5358  ; PerformMetaOperation(opcode=0x14=Serialize)
+  0x00208A0C: subs       r0, r0, #0
+  0x00208A10: movne      r0, #1
+  0x00208A14: sub        sp, r7, #8
+  0x00208A18: pop        {r4, r5, r7, pc}
+```
+
+### ChoreResource::MetaOperation_Serialize disassembly (appendix)
+
+```
+  0x002113E0: push       {r4, r5, r6, r7, lr}
+  0x002113E4: add        r7, sp, #0xc
+  0x002113E8: push       {r8, sl, fp}
+  0x002113EC: vpush      {d8, d9, d10, d11, d12, d13, d14, d15}
+  0x002113F0: sub        sp, sp, #0xa4
+  0x002113F4: str        r3, [sp, #0x14]
+  0x002113F8: ldr        r3, [pc, #0x5c8]
+  0x002113FC: str        r0, [sp, #0x20]
+  0x00211400: add        r0, sp, #0x44
+  0x00211404: ldr        r3, [pc, r3]
+  0x00211408: str        r3, [sp, #0x5c]
+  0x0021140C: ldr        r3, [pc, #0x5b8]
+  0x00211410: str        r1, [sp, #0x1c]
+  0x00211414: str        r2, [sp, #0x18]
+  0x00211418: add        r3, pc, r3
+  0x0021141C: str        r3, [sp, #0x60]
+  0x00211420: ldr        r3, [pc, #0x5a8]
+  0x00211424: str        r7, [sp, #0x64]
+  0x00211428: str        sp, [sp, #0x6c]
+  0x0021142C: add        r3, pc, r3
+  0x00211430: str        r3, [sp, #0x68]
+  0x00211434: bl         #0x58f9a4
+  0x00211438: ldr        r2, [sp, #0x14]
+  0x0021143C: ldr        r3, [sp, #0x20]
+  0x00211440: str        r2, [sp, #0x28]
+  0x00211444: str        r3, [sp, #0x2c]
+  0x00211448: ldr        r3, [r2, #0x20]
+  0x0021144C: cmp        r3, #1
+  0x00211450: ldreq      r2, [sp, #0x2c]
+  0x00211454: streq      r3, [r2, #4]
+  0x00211458: mvn        r3, #0
+  0x0021145C: ldr        r2, [sp, #0x18]
+  0x00211460: str        r3, [sp, #0x48]
+  0x00211464: ldr        r0, [sp, #0x2c]
+  0x00211468: ldr        r3, [sp, #0x28]
+  0x0021146C: ldr        r1, [sp, #0x1c]
+  0x00211470: bl         #0x1e99cc  ; Meta::MetaOperation_SerializeAsync (default member walk)
+  0x00211474: ldr        r2, [sp, #0x28]
+  0x00211478: ldr        r3, [r2, #0x20]
+  0x0021147C: cmp        r3, #1
+  0x00211480: bne        #0x211544
+  0x00211484: ldr        r2, [sp, #0x2c]
+  0x00211488: ldrb       r3, [r2, #0x6d]
+  0x0021148C: cmp        r3, #0
+  0x00211490: beq        #0x211544
+  0x00211494: add        r0, r2, #0x1c
+  0x00211498: add        r3, r2, #0x1c
+  0x0021149C: str        r3, [sp, #0x24]
+  0x002114A0: bl         #0x1b560  ; __ZNK10HandleBase22GetHandleObjectPointerEv
+  0x002114A4: str        r0, [sp, #0xa0]
+  0x002114A8: cmp        r0, #0
+  0x002114AC: ldreq      r2, [sp, #0x2c]
+  0x002114B0: strbeq     r0, [r2, #0x6d]
+  0x002114B4: beq        #0x211544
+  0x002114B8: ldr        r0, [sp, #0x24]
+  0x002114BC: mvn        r3, #0
+  0x002114C0: str        r3, [sp, #0x48]
+  0x002114C4: bl         #0x202344  ; __ZNK10HandleBase29GetHandleMetaClassDescriptionEv
+  0x002114C8: add        r2, sp, #0x9c
+  0x002114CC: add        r1, sp, #0xa0
+  0x002114D0: str        r0, [sp, #0x9c]
+  0x002114D4: bl         #0x1f02c0  ; __ZNK20MetaClassDescription20CastToConcreteObjectERPvRPKS_
+  0x002114D8: add        r0, sp, #0x80
+  0x002114DC: bl         #0xa2b0  ; __ZN6SymbolC1Ev
+  0x002114E0: ldr        r0, [sp, #0x9c]
+  0x002114E4: add        r1, sp, #0x80
+  0x002114E8: bl         #0x1f0bd4  ; __ZNK20MetaClassDescription20GetDescriptionSymbolER6Symbol
+  0x002114EC: add        r1, sp, #0x80
+  0x002114F0: ldr        r0, [sp, #0x28]
+  0x002114F4: bl         #0xb660c  ; __Z20PerformMetaSerializeI6SymbolEbP10MetaStreamPT_
+  0x002114F8: add        r0, sp, #0x78
+  0x002114FC: bl         #0xa2b0  ; __ZN6SymbolC1Ev
+  0x00211500: ldr        r0, [sp, #0x24]
+  0x00211504: bl         #0x202344  ; __ZNK10HandleBase29GetHandleMetaClassDescriptionEv
+  0x00211508: add        r1, sp, #0x78
+  0x0021150C: bl         #0x1f0bd4  ; __ZNK20MetaClassDescription20GetDescriptionSymbolER6Symbol
+  0x00211510: add        r1, sp, #0x78
+  0x00211514: ldr        r0, [sp, #0x28]
+  0x00211518: bl         #0xb660c  ; __Z20PerformMetaSerializeI6SymbolEbP10MetaStreamPT_
+  0x0021151C: ldr        r2, [sp, #0x28]
+  0x00211520: ldr        r3, [pc, #0x4ac]
+  0x00211524: ldr        r0, [sp, #0xa0]
+  0x00211528: ldr        r1, [sp, #0x9c]
+  0x0021152C: ldr        r3, [pc, r3]
+  0x00211530: str        r2, [sp, #4]
+  0x00211534: str        r3, [sp]
+  0x00211538: mov        r2, #0
+  0x0021153C: mov        r3, #0x14
+  0x00211540: bl         #0x5358  ; PerformMetaOperation(opcode=0x14=Serialize)
+  0x00211544: ldr        r2, [sp, #0x28]
+  0x00211548: ldr        r3, [r2, #0x20]
+  0x0021154C: cmp        r3, #0
+  0x00211550: bne        #0x2119a8
+  0x00211554: ldr        r2, [sp, #0x2c]
+  0x00211558: ldrb       r3, [r2, #0x6d]
+  0x0021155C: cmp        r3, #0
+  0x00211560: beq        #0x2117e8
+  0x00211564: ldr        r3, [r2, #4]
+  0x00211568: cmp        r3, #0
+  0x0021156C: bne        #0x2115bc
+  0x00211570: ldr        r3, [pc, #0x460]
+  0x00211574: ldr        r0, [sp, #0x28]
+  0x00211578: add        r1, sp, #0x80
+  0x0021157C: add        r3, pc, r3
+  0x00211580: add        r3, r3, #0xc
+  0x00211584: str        r3, [sp, #0x80]
+  0x00211588: mov        r3, #7
+  0x0021158C: str        r3, [sp, #0x48]
+  0x00211590: bl         #0x1ec380  ; __ZN10MetaStream16serialize_StringER6String
+  0x00211594: add        r0, sp, #0x78
+  0x00211598: add        r1, sp, #0x80
+  0x0021159C: bl         #0xa2f0  ; __ZN6SymbolC1ERK6String
+  0x002115A0: add        r0, sp, #0x78
+  0x002115A4: ldm        r0, {r0, r1}
+  0x002115A8: bl         #0x1f0378  ; __ZN20MetaClassDescription24FindMetaClassDescriptionEy
+  0x002115AC: str        r0, [sp, #0x30]
+  0x002115B0: add        r0, sp, #0x80
+  0x002115B4: bl         #0x3a34  ; __ZNSbIcSt11char_traitsIcE15StringAllocatorIcEED2Ev
+  0x002115B8: b          #0x2115e8
+  0x002115BC: add        r0, sp, #0x78
+  0x002115C0: mvn        r3, #0
+  0x002115C4: str        r3, [sp, #0x48]
+  0x002115C8: bl         #0xa2b0  ; __ZN6SymbolC1Ev
+  0x002115CC: add        r1, sp, #0x78
+  0x002115D0: ldr        r0, [sp, #0x28]
+  0x002115D4: bl         #0xb660c  ; __Z20PerformMetaSerializeI6SymbolEbP10MetaStreamPT_
+  0x002115D8: add        r0, sp, #0x78
+  0x002115DC: ldm        r0, {r0, r1}
+  0x002115E0: bl         #0x1f0378  ; __ZN20MetaClassDescription24FindMetaClassDescriptionEy
+  0x002115E4: str        r0, [sp, #0x30]
+  0x002115E8: ldr        r2, [sp, #0x2c]
+  0x002115EC: ldr        r3, [r2, #4]
+  0x002115F0: cmp        r3, #0
+  0x002115F4: bne        #0x211644
+  0x002115F8: ldr        r3, [pc, #0x3dc]
+  0x002115FC: ldr        r0, [sp, #0x28]
+  0x00211600: add        r1, sp, #0x80
+  0x00211604: add        r3, pc, r3
+  0x00211608: add        r3, r3, #0xc
+  0x0021160C: str        r3, [sp, #0x80]
+  0x00211610: mov        r3, #6
+  0x00211614: str        r3, [sp, #0x48]
+  0x00211618: bl         #0x1ec380  ; __ZN10MetaStream16serialize_StringER6String
+  0x0021161C: add        r0, sp, #0x78
+  0x00211620: add        r1, sp, #0x80
+  0x00211624: bl         #0xa2f0  ; __ZN6SymbolC1ERK6String
+  0x00211628: add        r0, sp, #0x78
+  0x0021162C: ldm        r0, {r0, r1}
+  0x00211630: bl         #0x1f0378  ; __ZN20MetaClassDescription24FindMetaClassDescriptionEy
+  0x00211634: str        r0, [sp, #0x34]
+  0x00211638: add        r0, sp, #0x80
+  0x0021163C: bl         #0x3a34  ; __ZNSbIcSt11char_traitsIcE15StringAllocatorIcEED2Ev
+  0x00211640: b          #0x211670
+  0x00211644: add        r0, sp, #0x78
+  0x00211648: mvn        r3, #0
+  0x0021164C: str        r3, [sp, #0x48]
+  0x00211650: bl         #0xa2b0  ; __ZN6SymbolC1Ev
+  0x00211654: add        r1, sp, #0x78
+  0x00211658: ldr        r0, [sp, #0x28]
+  0x0021165C: bl         #0xb660c  ; __Z20PerformMetaSerializeI6SymbolEbP10MetaStreamPT_
+  0x00211660: add        r0, sp, #0x78
+  0x00211664: ldm        r0, {r0, r1}
+  0x00211668: bl         #0x1f0378  ; __ZN20MetaClassDescription24FindMetaClassDescriptionEy
+  0x0021166C: str        r0, [sp, #0x34]
+  0x00211670: ldr        r0, [sp, #0x30]
+  0x00211674: mvn        r3, #0
+  0x00211678: str        r3, [sp, #0x48]
+  0x0021167C: bl         #0x1f02a0  ; __ZNK20MetaClassDescription3NewEv
+  0x00211680: ldr        r3, [pc, #0x358]
+  0x00211684: ldr        r1, [sp, #0x30]
+  0x00211688: mov        r2, #0
+  0x0021168C: ldr        r3, [pc, r3]
+  0x00211690: str        r3, [sp]
+  0x00211694: ldr        r3, [sp, #0x28]
+  0x00211698: str        r3, [sp, #4]
+  0x0021169C: mov        r3, #0x14
+  0x002116A0: str        r0, [sp, #0x38]
+  0x002116A4: bl         #0x5358  ; PerformMetaOperation(opcode=0x14=Serialize)
+  0x002116A8: ldr        r1, [sp, #0x38]
+  0x002116AC: ldr        r2, [sp, #0x34]
+  0x002116B0: ldr        r0, [sp, #0x30]
+  0x002116B4: bl         #0x1f02e0  ; __ZNK20MetaClassDescription10CastToBaseEPKvPKS_
+  0x002116B8: ldr        r2, [sp, #0x2c]
+  0x002116BC: add        r1, r2, #8
+  0x002116C0: ldr        r2, [sp, #0x34]
+  0x002116C4: mov        r3, r0
+  0x002116C8: add        r0, sp, #0x98
+  0x002116CC: bl         #0x1c798  ; __ZN16HandleObjectInfo5AllocERK6StringPK20MetaClassDescriptionPv
+  0x002116D0: mov        r3, #5
+  0x002116D4: str        r3, [sp, #0x48]
+  0x002116D8: ldr        r3, [sp, #0x2c]
+  0x002116DC: add        r1, sp, #0x98
+  0x002116E0: add        r0, r3, #0x1c
+  0x002116E4: bl         #0x2023c0  ; __ZN10HandleBaseaSE3PtrI16HandleObjectInfoE
+  0x002116E8: b          #0x2116fc
+  0x002116EC: ldr        r0, [sp, #0x98]
+  0x002116F0: mov        r3, #0
+  0x002116F4: str        r3, [sp, #0x98]
+  0x002116F8: b          #0x211760
+  0x002116FC: ldr        r0, [sp, #0x98]
+  0x00211700: mov        r2, #0
+  0x00211704: str        r2, [sp, #0x98]
+  0x00211708: cmp        r0, r2
+  0x0021170C: beq        #0x21171c
+  0x00211710: mvn        r1, #0
+  0x00211714: str        r1, [sp, #0x48]
+  0x00211718: bl         #0x1b60c  ; __Z17PtrModifyRefCountP16HandleObjectInfoi
+  0x0021171C: ldr        r3, [sp, #0x2c]
+  0x00211720: add        r0, sp, #0x94
+  0x00211724: mov        r2, #0
+  0x00211728: ldr        r1, [r3, #0x1c]
+  0x0021172C: mvn        r3, #0
+  0x00211730: str        r2, [sp, #0x94]
+  0x00211734: str        r3, [sp, #0x48]
+  0x00211738: bl         #0x530c  ; __ZN3PtrI16HandleObjectInfoE6AssignEPKS0_
+  0x0021173C: mov        r3, #4
+  0x00211740: ldr        r0, [sp, #0x94]
+  0x00211744: str        r3, [sp, #0x48]
+  0x00211748: mov        r1, #1
+  0x0021174C: bl         #0x1b830  ; __ZN16HandleObjectInfo19LockAsNotUnloadableEb
+  0x00211750: b          #0x211778
+  0x00211754: ldr        r0, [sp, #0x94]
+  0x00211758: mov        r3, #0
+  0x0021175C: str        r3, [sp, #0x94]
+  0x00211760: cmp        r0, r3
+  0x00211764: beq        #0x211970
+  0x00211768: mvn        r1, #0
+  0x0021176C: str        r3, [sp, #0x48]
+  0x00211770: bl         #0x1b60c  ; __Z17PtrModifyRefCountP16HandleObjectInfoi
+  0x00211774: b          #0x211970
+  0x00211778: ldr        r0, [sp, #0x94]
+  0x0021177C: mov        r3, #0
+  0x00211780: str        r3, [sp, #0x94]
+  0x00211784: cmp        r0, r3
+  0x00211788: beq        #0x211798
+  0x0021178C: mvn        r1, #0
+  0x00211790: str        r1, [sp, #0x48]
+  0x00211794: bl         #0x1b60c  ; __Z17PtrModifyRefCountP16HandleObjectInfoi
+  0x00211798: ldr        r2, [sp, #0x2c]
+  0x0021179C: add        r0, sp, #0x90
+  0x002117A0: mov        r3, #0
+  0x002117A4: ldr        r1, [r2, #0x1c]
+  0x002117A8: mvn        r2, #0
+  0x002117AC: str        r3, [sp, #0x90]
+  0x002117B0: str        r2, [sp, #0x48]
+  0x002117B4: bl         #0x530c  ; __ZN3PtrI16HandleObjectInfoE6AssignEPKS0_
+  0x002117B8: ldr        r2, [sp, #0x90]
+  0x002117BC: ldr        r3, [r2, #0x20]
+  0x002117C0: orr        r3, r3, #0x4000
+  0x002117C4: str        r3, [r2, #0x20]
+  0x002117C8: ldr        r0, [sp, #0x90]
+  0x002117CC: mov        r3, #0
+  0x002117D0: str        r3, [sp, #0x90]
+  0x002117D4: cmp        r0, r3
+  0x002117D8: beq        #0x211988
+  0x002117DC: mvn        r1, #0
+  0x002117E0: bl         #0x1b60c  ; __Z17PtrModifyRefCountP16HandleObjectInfoi
+  0x002117E4: b          #0x211988
+  0x002117E8: ldr        r2, [sp, #0x2c]
+  0x002117EC: ldrb       r2, [r2, #0x6f]
+  0x002117F0: cmp        r2, #0
+  0x002117F4: str        r2, [sp, #0xc]
+  0x002117F8: bne        #0x211988
+  0x002117FC: ldr        r2, [sp, #0x2c]
+  0x00211800: ldr        r3, [r2, #8]
+  0x00211804: ldr        r3, [r3, #-0xc]
+  0x00211808: cmp        r3, #0
+  0x0021180C: beq        #0x211988
+  0x00211810: ldr        r3, [sp, #0xc]
+  0x00211814: ldr        r1, [r2, #0x1c]
+  0x00211818: add        r0, sp, #0x8c
+  0x0021181C: str        r3, [sp, #0x8c]
+  0x00211820: mov        r3, #3
+  0x00211824: str        r3, [sp, #0x48]
+  0x00211828: bl         #0x530c  ; __ZN3PtrI16HandleObjectInfoE6AssignEPKS0_
+  0x0021182C: ldr        r2, [sp, #0x8c]
+  0x00211830: ldr        r3, [sp, #0xc]
+  0x00211834: cmp        r2, #0
+  0x00211838: str        r2, [sp, #0x3c]
+  0x0021183C: str        r3, [sp, #0x8c]
+  0x00211840: beq        #0x211860
+  0x00211844: mvn        r1, #0
+  0x00211848: ldr        r0, [sp, #0x3c]
+  0x0021184C: str        r1, [sp, #0x48]
+  0x00211850: bl         #0x1b60c  ; __Z17PtrModifyRefCountP16HandleObjectInfoi
+  0x00211854: ldr        r2, [sp, #0x3c]
+  0x00211858: cmp        r2, #0
+  0x0021185C: bne        #0x211988
+  0x00211860: ldr        r2, [sp, #0x2c]
+  0x00211864: ldr        r3, [sp, #0x2c]
+  0x00211868: add        r0, sp, #0x80
+  0x0021186C: add        r1, r2, #8
+  0x00211870: add        r3, r3, #8
+  0x00211874: str        r3, [sp, #8]
+  0x00211878: mvn        r3, #0
+  0x0021187C: str        r3, [sp, #0x48]
+  0x00211880: bl         #0x410ad4  ; __ZNK6String9ExtentionEv
+  0x00211884: mov        r3, #2
+  0x00211888: ldr        r0, [sp, #0x80]
+  0x0021188C: str        r3, [sp, #0x48]
+  0x00211890: bl         #0x1f0524  ; __ZN20MetaClassDescription35FindMetaClassDescriptionByExtentionEPKc
+  0x00211894: ldr        r1, [pc, #0x148]
+  0x00211898: ldr        r2, [sp, #0x2c]
+  0x0021189C: mov        r3, r0
+  0x002118A0: ldr        r1, [pc, r1]
+  0x002118A4: add        r2, r2, #0x1c
+  0x002118A8: add        r0, sp, #0x88
+  0x002118AC: str        r2, [sp, #0x40]
+  0x002118B0: ldr        r1, [r1]
+  0x002118B4: ldr        r2, [sp, #8]
+  0x002118B8: bl         #0x204b44  ; __ZN11ObjCacheMgr14RetrieveObjectERK6StringPK20MetaClassDescription
+  0x002118BC: mov        r3, #1
+  0x002118C0: ldr        r0, [sp, #0x40]
+  0x002118C4: str        r3, [sp, #0x48]
+  0x002118C8: add        r1, sp, #0x88
+  0x002118CC: bl         #0x2023c0  ; __ZN10HandleBaseaSE3PtrI16HandleObjectInfoE
+  0x002118D0: b          #0x211930
+  0x002118D4: ldr        r3, [sp, #0x48]
+  0x002118D8: ldr        r2, [sp, #0x4c]
+  0x002118DC: cmp        r3, #1
+  0x002118E0: str        r2, [sp, #0x10]
+  0x002118E4: beq        #0x211968
+  0x002118E8: cmp        r3, #2
+  0x002118EC: beq        #0x211970
+  0x002118F0: cmp        r3, #3
+  0x002118F4: beq        #0x211754
+  0x002118F8: cmp        r3, #4
+  0x002118FC: beq        #0x2116ec
+  0x00211900: cmp        r3, #5
+  0x00211904: cmpne      r3, #6
+  0x00211908: beq        #0x211968
+  0x0021190C: ldr        r0, [sp, #0x88]
+  0x00211910: mov        r3, #0
+  0x00211914: str        r3, [sp, #0x88]
+  0x00211918: cmp        r0, r3
+  0x0021191C: beq        #0x211968
+  0x00211920: mvn        r1, #0
+  0x00211924: str        r3, [sp, #0x48]
+  0x00211928: bl         #0x1b60c  ; __Z17PtrModifyRefCountP16HandleObjectInfoi
+  0x0021192C: b          #0x211968
+  0x00211930: ldr        r0, [sp, #0x88]
+  0x00211934: mov        r3, #0
+  0x00211938: str        r3, [sp, #0x88]
+  0x0021193C: cmp        r0, r3
+  0x00211940: beq        #0x211954
+  0x00211944: add        r3, r3, #2
+  0x00211948: mvn        r1, #0
+  0x0021194C: str        r3, [sp, #0x48]
+  0x00211950: bl         #0x1b60c  ; __Z17PtrModifyRefCountP16HandleObjectInfoi
+  0x00211954: mov        r3, #2
+  0x00211958: ldr        r0, [sp, #0x28]
+  0x0021195C: str        r3, [sp, #0x48]
+  0x00211960: bl         #0x1ebb60  ; __ZN10MetaStream12SetWritebackEv
+  0x00211964: b          #0x211980
+  0x00211968: add        r0, sp, #0x80
+  0x0021196C: bl         #0x3a34  ; __ZNSbIcSt11char_traitsIcE15StringAllocatorIcEED2Ev
+  0x00211970: ldr        r0, [sp, #0x10]
+  0x00211974: mvn        r3, #0
+  0x00211978: str        r3, [sp, #0x48]
+  0x0021197C: bl         #0x58f9a8
+  0x00211980: add        r0, sp, #0x80
+  0x00211984: bl         #0x3a34  ; __ZNSbIcSt11char_traitsIcE15StringAllocatorIcEED2Ev
+  0x00211988: ldr        r2, [sp, #0x2c]
+  0x0021198C: ldrb       r3, [r2, #0x6f]
+  0x00211990: cmp        r3, #0
+  0x00211994: beq        #0x2119a8
+  0x00211998: add        r0, r2, #0x1c
+  0x0021199C: mvn        r3, #0
+  0x002119A0: str        r3, [sp, #0x48]
+  0x002119A4: bl         #0x1b5b8  ; __ZN10HandleBase5ClearEv
+  0x002119A8: add        r0, sp, #0x44
+  0x002119AC: bl         #0x58f9ac
+  0x002119B0: mov        r0, #1
+  0x002119B4: sub        sp, r7, #0x58
+  0x002119B8: vpop       {d8, d9, d10, d11, d12, d13, d14, d15}
+  0x002119BC: sub        sp, r7, #0x18
+  0x002119C0: pop        {r8, sl, fp}
+  0x002119C4: pop        {r4, r5, r6, r7, pc}
+```
+
+## ChoreAgent MTRE Wire Format
+
+Resolved via `PerformMetaSerialize<ChoreAgent>` (VA 0x00208980), which calls `PerformMetaOperation` with opcode 0x14 (Serialize) into
+`ChoreAgent::MetaOperation_Serialize` (VA 0x0020B714).
+
+`ChoreAgent::MetaOperation_Serialize` is a **5-instruction stub** that
+unconditionally calls `Meta::MetaOperation_SerializeAsync` (VA 0x001E99CC)
+and returns.  There is **no custom code**: no version gates, no block
+wrapping, no embedded-object handling, no post-walk custom writes.
+
+All ChoreAgent fields are therefore **inline** in both MTRE and MSV formats.
+Registration order is from `ChoreAgent::InternalGetMetaClassDescription`
+(VA 0x0020808C).
+
+### ChoreAgent field walk order (MTRE inline, pure default walk)
+
+| Order | Field | Struct offset | Chore.h line | Framing | Notes |
+|-------|-------|---------------|--------------|---------|-------|
+| 1 | `mpChore` | 0x00 | Chore.h:353 | inline | Chore back-pointer |
+| 2 | `mAgentName` | 0x04 | Chore.h:366 | inline | String |
+| 3 | `mAABinding` | 0x08 | Chore.h:370 | inline | ActorAgentBinding — note: offset 8, registered after mAgentName |
+| 4 | `mFlags` | 0x18 | Chore.h:367 | inline | Flags |
+| 5 | `mResources` | 0x1C | Chore.h:368 | inline | DCArray<int> — resource index list |
+| 6 | `mAttachment` | 0x2C | Chore.h:369 | inline | Attachment struct (6 fields) |
+| 7 | `mAgentEnabledRule` | ? | Chore.h:371 | inline | Rule — offset not observed in MCD scan; last field registered |
+
+### ChoreAgent::MetaOperation_Serialize — observable BL calls
+
+| BL VA | Target VA | Resolved name |
+|-------|-----------|---------------|
+| 0x0020B71C | 0x001E99CC | Meta::MetaOperation_SerializeAsync (default member walk) |
+
+### PerformMetaSerialize\<ChoreAgent\> stub disassembly
+
+```
+  0x00208980: push       {r4, r5, r7, lr}
+  0x00208984: add        r7, sp, #8
+  0x00208988: sub        sp, sp, #8
+  0x0020898C: mov        r5, r1
+  0x00208990: mov        r4, r0
+  0x00208994: bl         #0x20826c  ; __ZN26MetaClassDescription_TypedI10ChoreAgentE23GetMetaClassDescriptionEv
+  0x00208998: ldr        r3, [pc, #0x2c]
+  0x0020899C: mov        r2, #0
+  0x002089A0: str        r4, [sp, #4]
+  0x002089A4: ldr        r3, [pc, r3]
+  0x002089A8: str        r3, [sp]
+  0x002089AC: mov        r3, #0x14
+  0x002089B0: mov        r1, r0
+  0x002089B4: mov        r0, r5
+  0x002089B8: bl         #0x5358  ; PerformMetaOperation(opcode=0x14=Serialize)
+  0x002089BC: subs       r0, r0, #0
+  0x002089C0: movne      r0, #1
+  0x002089C4: sub        sp, r7, #8
+  0x002089C8: pop        {r4, r5, r7, pc}
+```
+
+### ChoreAgent::MetaOperation_Serialize disassembly (appendix)
+
+```
+  0x0020B714: push       {r7, lr}
+  0x0020B718: add        r7, sp, #0
+  0x0020B71C: bl         #0x1e99cc  ; Meta::MetaOperation_SerializeAsync (default member walk)
+  0x0020B720: mov        r0, #1
+  0x0020B724: pop        {r7, pc}
+```
+
+## Post-Loop Framing
+
+The outer `Chore::MetaOperation_Serialize` loop (VA 0x00205788) drives
+both the ChoreResource and ChoreAgent post-loops.  The framing details:
+
+**No outer count written.** The loop counts `mNumResources` and `mNumAgents`
+are already serialized as plain `long` fields in the default meta walk
+(field order rows 4 and 5 in the Observed member-read order table above).
+The outer loop does NOT write a separate u32 count before iterating — it
+reads `ldr r3, [r2, #0xc]` (ChoreResource count) and `ldr r3, [r2, #0x10]`
+(ChoreAgent count) directly from the Chore object fields at runtime.
+
+**No block wrap around the loop.** There are no `BeginBlock`/`EndBlock`
+calls framing the entire resource list or agent list.  Each element is
+serialized back-to-back as a flat sequence.
+
+**Per-element framing** (plain element-after-element):
+- ChoreResource: `PerformMetaSerialize<ChoreResource>` → `PerformMetaOperation`
+  opcode 0x14 → `ChoreResource::MetaOperation_Serialize` → inline default walk.
+  No block header per element.
+- ChoreAgent: `PerformMetaSerialize<ChoreAgent>` → `PerformMetaOperation`
+  opcode 0x14 → `ChoreAgent::MetaOperation_Serialize` → inline default walk.
+  No block header per element.
+
+**MTRE vs MSV5 difference:** In MSV5 (sv >= 5) the MetaStream writes a
+block-size prefix for each member read (via `BeginBlock`/`EndBlock`).
+In MTRE (sv <= 3) there are no block headers — bytes flow contiguously.
+The `ChoreResource::MetaOperation_Serialize` version gate at VA 0x0021144C
+(`cmp r3, #1`) separates the two paths only for the mVersion/mhObject
+embedded-write logic, NOT for block-wrapping.
+
+**Conclusion for the Python decoder:** To populate `chore.resources` and
+`chore.agents` from MTRE files, the decoder must read
+`mNumResources` × ChoreResource instances and `mNumAgents` × ChoreAgent
+instances in order, each decoded by their respective inline field walks,
+with NO count prefix and NO block header separating elements.
+

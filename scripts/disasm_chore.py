@@ -839,6 +839,344 @@ def write_disasm_artifact(
     print(f"Wrote {out_path}")
 
 
+# ─── Gap-01: PerformMetaSerialize<ChoreResource/ChoreAgent> disassembly ──────
+#
+# These functions were located in Phase 7-01 (VA 0x002089D0 / 0x00208980) but
+# their internal structure and callee call graphs were not documented.  Gap-01
+# adds:
+#   - Disassembly of each PerformMetaSerialize<T> stub (both are 19-instruction
+#     thunks that call PerformMetaOperation with opcode 0x14)
+#   - Full disassembly of ChoreResource::MetaOperation_Serialize (0x002113E0)
+#   - Full disassembly of ChoreAgent::MetaOperation_Serialize   (0x0020B714)
+#   - Field-walk order extracted from InternalGetMetaClassDescription for each
+#   - Per-field framing classification (inline vs block-wrapped)
+#   - Version-gate identification (MSV write path vs MTRE read path)
+#   - Post-loop framing: does the outer Chore loop write a u32 count?
+
+# VA constants for the two post-loop targets
+VA_PERFORM_META_SER_CHORE_RESOURCE  = 0x002089D0
+VA_CHORE_RESOURCE_META_OP_SERIALIZE = 0x002113E0
+VA_CHORE_RESOURCE_INTERNAL_MCD      = 0x002082B8
+
+VA_PERFORM_META_SER_CHORE_AGENT     = 0x00208980
+VA_CHORE_AGENT_META_OP_SERIALIZE    = 0x0020B714
+VA_CHORE_AGENT_INTERNAL_MCD         = 0x0020808C
+
+# ChoreResource field registration order extracted from
+# ChoreResource::InternalGetMetaClassDescription (VA 0x002082B8).
+# Each row: (registration_order, field_name, struct_byte_offset, chore_h_line,
+#            framing, notes)
+# framing = "inline" or "block" (BeginBlock/EndBlock present in MetaOp_Serialize)
+# All MTRE-format fields are "inline" — no BeginBlock calls observed in
+# ChoreResource::MetaOperation_Serialize (0x002113E0).
+CHORE_RESOURCE_FIELDS = [
+    # order  name                   offset  h_line  framing   notes
+    (1,  "mpChore",            0x00,  256,  "inline",  "Chore back-pointer; not serialized in standard meta walk"),
+    (2,  "mVersion",           0x04,  269,  "inline",  "Version field; cmp r3, #1 at VA 0x0021144C gates the write path"),
+    (3,  "mResName",           0x08,  271,  "inline",  "Symbol — type hash + CRC64 pair"),
+    (4,  "mResLength",         0x0C,  272,  "inline",  "float"),
+    (5,  "mPriority",          0x10,  273,  "inline",  "long"),
+    (6,  "mFlags",             0x14,  274,  "inline",  "Flags"),
+    (7,  "mResourceGroup",     0x18,  275,  "inline",  "String"),
+    (8,  "mhObject",           0x1C,  276,  "inline",  "HandleBase; embedded-object branch at 0x00211494"),
+    (9,  "mControlAnimation",  0x20,  280,  "inline",  "Animation; NOT decoded in MTRE path (skip block)"),
+    (10, "mBlocks",            0x5C,  281,  "inline",  "DCArray<Block>"),
+    (11, "mbNoPose",           0x6C,  282,  "inline",  "bool"),
+    (12, "mbEmbedded",         0x6D,  283,  "inline",  "bool"),
+    (13, "mbEnabled",          0x6E,  284,  "inline",  "bool"),
+    (14, "mbIsAgentResource",  0x6F,  285,  "inline",  "bool"),
+    (15, "mbViewGraphs",       0x70,  286,  "inline",  "bool"),
+    (16, "mbViewEmptyGraphs",  0x71,  287,  "inline",  "bool"),
+    (17, "mbViewProperties",   0x72,  288,  "inline",  "bool"),
+    (18, "mbViewResourceGroups", 0x73, 289, "inline",  "bool"),
+    (19, "mResourceProperties", 0x7C, 290,  "inline",  "PropertySet"),
+    (20, "mResourceGroupInclude", 0xC0, 291, "inline", "Map<Symbol,float,Symbol::CompareCRC>"),
+    (21, "mAAStatus",          0x78,  292,  "inline",  "AutoActStatus"),
+]
+
+# ChoreAgent field registration order extracted from
+# ChoreAgent::InternalGetMetaClassDescription (VA 0x0020808C).
+# ChoreAgent::MetaOperation_Serialize (VA 0x0020B714) is a 5-instruction stub
+# that ONLY calls Meta::MetaOperation_SerializeAsync — pure default walk,
+# no custom code, no version gates, no block wrapping at all.
+CHORE_AGENT_FIELDS = [
+    # order  name              offset  h_line  framing   notes
+    (1,  "mpChore",        0x00,  353,  "inline",  "Chore back-pointer"),
+    (2,  "mAgentName",     0x04,  366,  "inline",  "String"),
+    (3,  "mAABinding",     0x08,  370,  "inline",  "ActorAgentBinding — note: offset 8, registered after mAgentName"),
+    (4,  "mFlags",         0x18,  367,  "inline",  "Flags"),
+    (5,  "mResources",     0x1C,  368,  "inline",  "DCArray<int> — resource index list"),
+    (6,  "mAttachment",    0x2C,  369,  "inline",  "Attachment struct (6 fields)"),
+    (7,  "mAgentEnabledRule", None, 371, "inline",  "Rule — offset not observed in MCD scan; last field registered"),
+]
+
+
+def disassemble_post_loop_targets(
+    data: bytes,
+    text_segment: TextSegment,
+    addr_to_name: dict[int, str],
+) -> dict:
+    """
+    Disassemble both PerformMetaSerialize<T> stubs and their concrete
+    MetaOperation_Serialize callees.  Returns a dict with keys:
+      'chore_resource': {
+          'perform_stub':    list[Instruction],  # PerformMetaSerialize<ChoreResource>
+          'meta_op_serialize': list[Instruction], # ChoreResource::MetaOperation_Serialize
+      }
+      'chore_agent': {
+          'perform_stub':    list[Instruction],
+          'meta_op_serialize': list[Instruction],
+      }
+    """
+    combined = dict(addr_to_name)
+    combined.update(_CHORE_KNOWN_ADDRS)
+    combined.update({
+        VA_PERFORM_META_SER_CHORE_RESOURCE:  "PerformMetaSerialize<ChoreResource>",
+        VA_CHORE_RESOURCE_META_OP_SERIALIZE: "ChoreResource::MetaOperation_Serialize",
+        VA_PERFORM_META_SER_CHORE_AGENT:     "PerformMetaSerialize<ChoreAgent>",
+        VA_CHORE_AGENT_META_OP_SERIALIZE:    "ChoreAgent::MetaOperation_Serialize",
+        0x0020826C: "MetaClassDescription_Typed<ChoreAgent>::GetMetaClassDescription",
+        0x0020877C: "MetaClassDescription_Typed<ChoreResource>::GetMetaClassDescription",
+        0x00005358: "PerformMetaOperation(opcode=0x14=Serialize)",
+        0x001E99CC: "Meta::MetaOperation_SerializeAsync (default member walk)",
+    })
+
+    result = {}
+    for key, stub_va, impl_va in (
+        ("chore_resource", VA_PERFORM_META_SER_CHORE_RESOURCE, VA_CHORE_RESOURCE_META_OP_SERIALIZE),
+        ("chore_agent",    VA_PERFORM_META_SER_CHORE_AGENT,    VA_CHORE_AGENT_META_OP_SERIALIZE),
+    ):
+        stub_insns = disassemble_function(data, text_segment, stub_va, combined, 100)
+        impl_insns = disassemble_function(data, text_segment, impl_va, combined, 500)
+        result[key] = {
+            "stub_va":            stub_va,
+            "impl_va":            impl_va,
+            "perform_stub":       stub_insns,
+            "meta_op_serialize":  impl_insns,
+        }
+        print(
+            f"  {key}: stub={len(stub_insns)} insns @ 0x{stub_va:08X}, "
+            f"impl={len(impl_insns)} insns @ 0x{impl_va:08X}"
+        )
+
+    return result
+
+
+def _bl_calls(insns: list[Instruction], addr_to_name: dict[int, str]) -> list[tuple]:
+    """Return list of (bl_va, target_va, name) for all BL/BLX in insns."""
+    combined = dict(addr_to_name)
+    combined.update(_CHORE_KNOWN_ADDRS)
+    combined.update({
+        VA_CHORE_RESOURCE_META_OP_SERIALIZE: "ChoreResource::MetaOperation_Serialize",
+        VA_CHORE_AGENT_META_OP_SERIALIZE:    "ChoreAgent::MetaOperation_Serialize",
+        0x00005358: "PerformMetaOperation(opcode=0x14=Serialize)",
+    })
+    out = []
+    for insn in insns:
+        if insn.call_target is None:
+            continue
+        name = combined.get(insn.call_target, insn.call_name or f"<0x{insn.call_target:08X}>")
+        out.append((insn.address, insn.call_target, name))
+    return out
+
+
+def _format_insns(insns: list[Instruction], addr_to_name: dict[int, str]) -> list[str]:
+    """Format instructions as '  0xVA: mnem op [; comment]' lines."""
+    combined = dict(addr_to_name)
+    combined.update(_CHORE_KNOWN_ADDRS)
+    combined.update({
+        VA_CHORE_RESOURCE_META_OP_SERIALIZE: "ChoreResource::MetaOperation_Serialize",
+        VA_CHORE_AGENT_META_OP_SERIALIZE:    "ChoreAgent::MetaOperation_Serialize",
+        0x00005358: "PerformMetaOperation(opcode=0x14=Serialize)",
+    })
+    lines = []
+    for insn in insns:
+        note = ""
+        if insn.call_target is not None:
+            n = combined.get(insn.call_target, insn.call_name or "")
+            if n:
+                note = f"  ; {n}"
+        lines.append(f"  0x{insn.address:08X}: {insn.mnemonic:<10s} {insn.op_str}{note}")
+    return lines
+
+
+def append_gap01_sections(
+    out_path: Path,
+    disasm_results: dict,
+    addr_to_name: dict[int, str],
+) -> None:
+    """
+    Append the three new Gap-01 sections to docs/CHORE_DISASM.md:
+      ## ChoreResource MTRE Wire Format
+      ## ChoreAgent MTRE Wire Format
+      ## Post-Loop Framing
+    """
+    lines: list[str] = []
+
+    # ── ChoreResource MTRE Wire Format ────────────────────────────────────────
+    cr = disasm_results["chore_resource"]
+    lines.append("")
+    lines.append("## ChoreResource MTRE Wire Format")
+    lines.append("")
+    lines.append(
+        f"Resolved via `PerformMetaSerialize<ChoreResource>` (VA 0x{cr['stub_va']:08X}), "
+        f"which calls `PerformMetaOperation` with opcode 0x14 (Serialize) into\n"
+        f"`ChoreResource::MetaOperation_Serialize` (VA 0x{cr['impl_va']:08X}).\n"
+        f"\n"
+        f"The concrete serializer calls `Meta::MetaOperation_SerializeAsync` (VA 0x001E99CC)\n"
+        f"which walks `ChoreResource::InternalGetMetaClassDescription` (VA 0x{VA_CHORE_RESOURCE_INTERNAL_MCD:08X})\n"
+        f"to iterate the 21 registered fields in registration order.\n"
+        f"\n"
+        f"**No `BeginBlock`/`EndBlock` calls are present** in\n"
+        f"`ChoreResource::MetaOperation_Serialize` — all fields are **inline** (MTRE framing).\n"
+        f"The only version-gated branch is at VA 0x0021144C (`cmp r3, #1`) which\n"
+        f"activates the `mVersion = 1` write-path for MSV-format streams.  MTRE streams\n"
+        f"(sv <= 3) pass through this branch without setting `mVersion = 1`.\n"
+        f"\n"
+        f"An **embedded-object branch** at VA 0x00211494 handles `mhObject` when\n"
+        f"`mbEmbedded == true` (ldrb r3, [r2, #0x6d]): it reads a `Symbol` name for\n"
+        f"the type, instantiates via `MetaClassDescription::New`, serializes the nested\n"
+        f"object via `PerformMetaOperation(0x14)`, and stores it via `HandleObjectInfo`.\n"
+        f"When `mbEmbedded == false` the handle path is skipped."
+    )
+    lines.append("")
+    lines.append("### ChoreResource field walk order (MTRE inline)")
+    lines.append("")
+    lines.append(
+        "Registration extracted from `ChoreResource::InternalGetMetaClassDescription`\n"
+        f"(VA 0x{VA_CHORE_RESOURCE_INTERNAL_MCD:08X}).  All fields are serialized inline\n"
+        "by `Meta::MetaOperation_SerializeAsync`; no per-field block headers."
+    )
+    lines.append("")
+    lines.append("| Order | Field | Struct offset | Chore.h line | Framing | Notes |")
+    lines.append("|-------|-------|---------------|--------------|---------|-------|")
+    for order, name, offset, h_line, framing, notes in CHORE_RESOURCE_FIELDS:
+        off_str = f"0x{offset:02X}" if offset is not None else "?"
+        lines.append(
+            f"| {order} | `{name}` | {off_str} | Chore.h:{h_line} | {framing} | {notes} |"
+        )
+    lines.append("")
+    lines.append("### ChoreResource::MetaOperation_Serialize — observable BL calls")
+    lines.append("")
+    lines.append("| BL VA | Target VA | Resolved name |")
+    lines.append("|-------|-----------|---------------|")
+    for bl_va, tgt_va, name in _bl_calls(cr["meta_op_serialize"], addr_to_name):
+        lines.append(f"| 0x{bl_va:08X} | 0x{tgt_va:08X} | {name} |")
+    lines.append("")
+    lines.append("### PerformMetaSerialize\\<ChoreResource\\> stub disassembly")
+    lines.append("")
+    lines.append("```")
+    lines.extend(_format_insns(cr["perform_stub"], addr_to_name))
+    lines.append("```")
+    lines.append("")
+    lines.append("### ChoreResource::MetaOperation_Serialize disassembly (appendix)")
+    lines.append("")
+    lines.append("```")
+    lines.extend(_format_insns(cr["meta_op_serialize"], addr_to_name))
+    lines.append("```")
+    lines.append("")
+
+    # ── ChoreAgent MTRE Wire Format ───────────────────────────────────────────
+    ca = disasm_results["chore_agent"]
+    lines.append("## ChoreAgent MTRE Wire Format")
+    lines.append("")
+    lines.append(
+        f"Resolved via `PerformMetaSerialize<ChoreAgent>` (VA 0x{ca['stub_va']:08X}), "
+        f"which calls `PerformMetaOperation` with opcode 0x14 (Serialize) into\n"
+        f"`ChoreAgent::MetaOperation_Serialize` (VA 0x{ca['impl_va']:08X}).\n"
+        f"\n"
+        f"`ChoreAgent::MetaOperation_Serialize` is a **5-instruction stub** that\n"
+        f"unconditionally calls `Meta::MetaOperation_SerializeAsync` (VA 0x001E99CC)\n"
+        f"and returns.  There is **no custom code**: no version gates, no block\n"
+        f"wrapping, no embedded-object handling, no post-walk custom writes.\n"
+        f"\n"
+        f"All ChoreAgent fields are therefore **inline** in both MTRE and MSV formats.\n"
+        f"Registration order is from `ChoreAgent::InternalGetMetaClassDescription`\n"
+        f"(VA 0x{VA_CHORE_AGENT_INTERNAL_MCD:08X})."
+    )
+    lines.append("")
+    lines.append("### ChoreAgent field walk order (MTRE inline, pure default walk)")
+    lines.append("")
+    lines.append("| Order | Field | Struct offset | Chore.h line | Framing | Notes |")
+    lines.append("|-------|-------|---------------|--------------|---------|-------|")
+    for order, name, offset, h_line, framing, notes in CHORE_AGENT_FIELDS:
+        off_str = f"0x{offset:02X}" if offset is not None else "?"
+        lines.append(
+            f"| {order} | `{name}` | {off_str} | Chore.h:{h_line} | {framing} | {notes} |"
+        )
+    lines.append("")
+    lines.append("### ChoreAgent::MetaOperation_Serialize — observable BL calls")
+    lines.append("")
+    lines.append("| BL VA | Target VA | Resolved name |")
+    lines.append("|-------|-----------|---------------|")
+    for bl_va, tgt_va, name in _bl_calls(ca["meta_op_serialize"], addr_to_name):
+        lines.append(f"| 0x{bl_va:08X} | 0x{tgt_va:08X} | {name} |")
+    lines.append("")
+    lines.append("### PerformMetaSerialize\\<ChoreAgent\\> stub disassembly")
+    lines.append("")
+    lines.append("```")
+    lines.extend(_format_insns(ca["perform_stub"], addr_to_name))
+    lines.append("```")
+    lines.append("")
+    lines.append("### ChoreAgent::MetaOperation_Serialize disassembly (appendix)")
+    lines.append("")
+    lines.append("```")
+    lines.extend(_format_insns(ca["meta_op_serialize"], addr_to_name))
+    lines.append("```")
+    lines.append("")
+
+    # ── Post-Loop Framing ────────────────────────────────────────────────────
+    lines.append("## Post-Loop Framing")
+    lines.append("")
+    lines.append(
+        "The outer `Chore::MetaOperation_Serialize` loop (VA 0x00205788) drives\n"
+        "both the ChoreResource and ChoreAgent post-loops.  The framing details:\n"
+        "\n"
+        "**No outer count written.** The loop counts `mNumResources` and `mNumAgents`\n"
+        "are already serialized as plain `long` fields in the default meta walk\n"
+        "(field order rows 4 and 5 in the Observed member-read order table above).\n"
+        "The outer loop does NOT write a separate u32 count before iterating — it\n"
+        "reads `ldr r3, [r2, #0xc]` (ChoreResource count) and `ldr r3, [r2, #0x10]`\n"
+        "(ChoreAgent count) directly from the Chore object fields at runtime.\n"
+        "\n"
+        "**No block wrap around the loop.** There are no `BeginBlock`/`EndBlock`\n"
+        "calls framing the entire resource list or agent list.  Each element is\n"
+        "serialized back-to-back as a flat sequence.\n"
+        "\n"
+        "**Per-element framing** (plain element-after-element):\n"
+        "- ChoreResource: `PerformMetaSerialize<ChoreResource>` → `PerformMetaOperation`\n"
+        "  opcode 0x14 → `ChoreResource::MetaOperation_Serialize` → inline default walk.\n"
+        "  No block header per element.\n"
+        "- ChoreAgent: `PerformMetaSerialize<ChoreAgent>` → `PerformMetaOperation`\n"
+        "  opcode 0x14 → `ChoreAgent::MetaOperation_Serialize` → inline default walk.\n"
+        "  No block header per element.\n"
+        "\n"
+        "**MTRE vs MSV5 difference:** In MSV5 (sv >= 5) the MetaStream writes a\n"
+        "block-size prefix for each member read (via `BeginBlock`/`EndBlock`).\n"
+        "In MTRE (sv <= 3) there are no block headers — bytes flow contiguously.\n"
+        "The `ChoreResource::MetaOperation_Serialize` version gate at VA 0x0021144C\n"
+        "(`cmp r3, #1`) separates the two paths only for the mVersion/mhObject\n"
+        "embedded-write logic, NOT for block-wrapping.\n"
+        "\n"
+        "**Conclusion for the Python decoder:** To populate `chore.resources` and\n"
+        "`chore.agents` from MTRE files, the decoder must read\n"
+        "`mNumResources` × ChoreResource instances and `mNumAgents` × ChoreAgent\n"
+        "instances in order, each decoded by their respective inline field walks,\n"
+        "with NO count prefix and NO block header separating elements."
+    )
+    lines.append("")
+
+    existing = out_path.read_text(encoding="utf-8")
+    # Strip trailing newline before appending
+    combined_text = existing.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+    out_path.write_text(combined_text, encoding="utf-8")
+    print(f"Appended Gap-01 sections to {out_path}")
+
+    # Print VA summary to stdout for CI verification
+    print(f"\nChoreResource::MetaOperation_Serialize VA: 0x{VA_CHORE_RESOURCE_META_OP_SERIALIZE:08X}")
+    print(f"ChoreAgent::MetaOperation_Serialize   VA: 0x0020B714")
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -957,6 +1295,11 @@ def main() -> None:
     print(f"Resolution:               {va_info['resolution']}")
     print(f"Mangled symbol:           {va_info.get('mangled') or '(stripped)'}")
     print(f"Artifact:                 {out_path}")
+
+    # ── Step 8: Gap-01 — disassemble post-loop template instantiations ──
+    print("\nDisassembling post-loop PerformMetaSerialize<T> targets (Gap-01)...")
+    disasm_results = disassemble_post_loop_targets(data, text_seg, addr_to_name)
+    append_gap01_sections(out_path, disasm_results, addr_to_name)
 
 
 if __name__ == "__main__":
