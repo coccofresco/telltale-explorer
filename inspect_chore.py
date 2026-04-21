@@ -1,16 +1,15 @@
 """
 Surface-level .chore inspector for Telltale MTRE choreography files.
 
-Does NOT fully parse the Chore/ChoreResource/ChoreAgent tree — that requires a
-complete MetaStream+MetaClass reflection reader. Instead, this extracts what
-is directly recoverable without schema:
+Rewritten in Phase 8 (Plan 08-03) to use the full telltale.chore.parse_chore
+decoder + extract_handles instead of hand-rolled length-prefix string scanning.
 
-    - mName, mFlags, mLength, mNumResources, mNumAgents (top-level primitives)
-    - Every Handle<T> string embedded in the file (anims, chores, meshes, etc.)
-      found by scanning for the length-prefixed String pattern used in MTRE
-      (Handle<T> in stream version < 5 serializes as a bare String).
-    - Every Symbol CRC64 that resolves to a known bone/anim name via the HashDB
-    - Every readable ASCII run (agent names, scene paths, script identifiers).
+Extracts:
+    - mName, mFlags, mLength, mNumResources, mNumAgents (top-level primitives,
+      now sourced from the fully decoded Chore dataclass)
+    - Every Handle<T> string embedded in the file, filtered by known asset
+      extensions (_PLAUSIBLE_HANDLE_EXTS), sorted and deduplicated
+    - Every readable ASCII run (agent names, scene paths, script identifiers)
 
 Useful for:
     - Quickly listing which animations/chores a .chore references
@@ -22,12 +21,9 @@ from __future__ import annotations
 
 import os
 import re
-import struct
 import sys
 from dataclasses import dataclass, field
-from typing import List, Set
-
-from telltale import metastream
+from typing import List
 
 
 @dataclass
@@ -43,15 +39,8 @@ class ChoreSurface:
 
 
 # ------------------------------------------------------------
-# Helpers
+# Constants
 # ------------------------------------------------------------
-
-def _u32(d: bytes, p: int) -> int:
-    return struct.unpack_from("<I", d, p)[0]
-
-def _f32(d: bytes, p: int) -> float:
-    return struct.unpack_from("<f", d, p)[0]
-
 
 _PLAUSIBLE_HANDLE_EXTS = (
     ".anm", ".chore", ".d3dmesh", ".skl", ".scene", ".prop", ".lua",
@@ -60,66 +49,38 @@ _PLAUSIBLE_HANDLE_EXTS = (
 )
 
 
-def _find_length_prefixed_strings(d: bytes, min_len: int = 3) -> List[tuple[int, str]]:
-    """Scan d for u32_len + ASCII_chars sequences. Returns (file_offset, string)."""
-    out: List[tuple[int, str]] = []
-    seen: Set[int] = set()
-    i = 0
-    while i + 4 < len(d):
-        n = _u32(d, i)
-        if min_len <= n <= 256 and i + 4 + n <= len(d):
-            chunk = d[i + 4:i + 4 + n]
-            if all(0x20 <= b < 0x7f for b in chunk):
-                s = chunk.decode("ascii")
-                # plausible filename if it looks like a token or has a known ext
-                if re.fullmatch(r"[A-Za-z0-9_\-./]+", s):
-                    if (s.lower().endswith(_PLAUSIBLE_HANDLE_EXTS)
-                        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", s)):
-                        if i not in seen:
-                            seen.add(i)
-                            out.append((i, s))
-                        i += 4 + n
-                        continue
-        i += 1
-    return out
-
-
 # ------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------
 
 def inspect(path: str) -> ChoreSurface:
+    from telltale.chore import parse_chore, extract_handles
+
     with open(path, "rb") as f:
         d = f.read()
-    h = metastream.parse_header(path)
-    p = h.data_offset
+    file_size = len(d)
 
-    # mName block (String, blocked): size(u32) + strlen(u32) + chars
-    name_blk = _u32(d, p); name_end = p + name_blk; p += 4
-    slen = _u32(d, p); p += 4
-    name = d[p:p+slen].decode("latin1"); p = name_end
+    chore = parse_chore(path)
 
-    # Top-level primitives — field offsets not fully pinned down (some Chore
-    # sub-structures like PropertySet, LocalizeInfo, DependencyLoader and
-    # ToolProps still need MetaStream block-traversal work). Parsed
-    # best-effort; use the `handles` list for reliable info.
-    flags = _u32(d, p); p += 4
-    length = _f32(d, p); p += 4
-    num_res = _u32(d, p); p += 4
-    num_ag = _u32(d, p); p += 4
+    handles = sorted({
+        h for h in extract_handles(chore, path)
+        if h.lower().endswith(_PLAUSIBLE_HANDLE_EXTS)
+    })
 
-    handles_with_off = _find_length_prefixed_strings(d[p:])
-    handles = sorted({s for _, s in handles_with_off if s.lower().endswith(_PLAUSIBLE_HANDLE_EXTS)})
-
-    # Misc ASCII runs (>=4 chars) for debugging
-    ascii_runs = sorted({m.group().decode()
-                         for m in re.finditer(rb"[\x20-\x7e]{4,}", d)})
+    ascii_runs = sorted({
+        m.group().decode()
+        for m in re.finditer(rb"[\x20-\x7e]{4,}", d)
+    })
 
     return ChoreSurface(
-        name=name, flags=flags, length=length,
-        num_resources=num_res, num_agents=num_ag,
-        handles=handles, ascii_runs=ascii_runs,
-        file_size=len(d),
+        name=chore.mName,
+        flags=chore.mFlags,
+        length=chore.mLength,
+        num_resources=chore.mNumResources,
+        num_agents=chore.mNumAgents,
+        handles=handles,
+        ascii_runs=ascii_runs,
+        file_size=file_size,
     )
 
 
